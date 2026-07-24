@@ -7,14 +7,15 @@
   const REPORT_GRIP = 5;
   const CALIBRATION_ROUNDS = 3;
   const CALIBRATION_HOLD_MS = 1500;
-  const SHOT_COOLDOWN_MS = 800;
-  const GYRO_FIRE_MIN = 260;
-  const GYRO_FIRE_STRONG = 480;
-  const GYRO_RELEASE = 190;
-  const ACCEL_FIRE_MIN = 0.16;
-  const ACCEL_FIRE_STRONG = 0.30;
-  const ACCEL_RELEASE = 0.09;
-  const MOTION_CONFIRM_MS = 55;
+  const SHOT_COOLDOWN_MS = 1150;
+  const GYRO_FIRE_MIN = 520;
+  const GYRO_FIRE_STRONG = 760;
+  const GYRO_RELEASE = 260;
+  const ACCEL_FIRE_MIN = 0.34;
+  const ACCEL_FIRE_STRONG = 0.52;
+  const ACCEL_RELEASE = 0.16;
+  const MOTION_CONFIRM_MS = 90;
+  const MOTION_REQUIRED_HITS = 3;
   const MAX_PLAYERS = 8;
 
   const queue = [];
@@ -51,7 +52,7 @@
     if (!player) return;
     const data = new Uint8Array([3, 6, 0, 1, intensity, duration]);
     await command(player.device, 11, data);
-    state.hapticIgnoreUntil = performance.now() + 80;
+    state.hapticIgnoreUntil = performance.now() + 180;
   }
 
   function makePlayer(device, playerId) {
@@ -70,6 +71,7 @@
       stableSince: 0,
       motionCandidate: 0,
       motionHits: 0,
+      motionPeak: 0,
       gyroNoise: 35,
       impulseNoise: 0.025,
       lastShot: 0,
@@ -98,12 +100,12 @@
       return;
     }
     const force = grip - player.baseline;
-    const isHolding = force > Math.max(45, player.travel * 0.06);
+    const isHolding = force > Math.max(28, player.travel * 0.045);
     if (state.phase === "play" && !isHolding) {
       player.baseline = player.baseline * 0.995 + grip * 0.005;
     }
-    const rawStrength = Math.max(0, Math.min(1, force / Math.max(player.travel, 120)));
-    const strength = force > Math.max(35, player.travel * 0.04) ? Math.max(0.16, Math.sqrt(rawStrength)) : 0;
+    const rawStrength = Math.max(0, Math.min(1, force / Math.max(player.travel, 80)));
+    const strength = force > Math.max(20, player.travel * 0.03) ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
     if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
       player.tracking = strength;
       emit({type: "track_player", player: player.playerId, value: strength});
@@ -128,13 +130,13 @@
     const accel = Math.hypot(ax, ay, az);
     if (player.accelReference == null) player.accelReference = Math.max(accel, 0.001);
     const impulse = Math.abs(accel - player.accelReference) / Math.max(player.accelReference, 0.001);
-    if (gyro < 200 && impulse < 0.20) {
+    if (gyro < 260 && impulse < 0.18) {
       player.accelReference = player.accelReference * 0.995 + accel * 0.005;
     }
     player.gyro = gyro;
     player.impulse = impulse;
     if (state.phase === "play" && performance.now() >= state.hapticIgnoreUntil) {
-      if (gyro < 180 && impulse < 0.13) {
+      if (gyro < 240 && impulse < 0.14) {
         player.gyroNoise = player.gyroNoise * 0.985 + gyro * 0.015;
         player.impulseNoise = player.impulseNoise * 0.985 + impulse * 0.015;
       }
@@ -154,29 +156,42 @@
       return;
     }
 
-    const gyroThreshold = Math.max(GYRO_FIRE_MIN, player.gyroNoise * 4.0 + 110);
-    const impulseThreshold = Math.max(ACCEL_FIRE_MIN, player.impulseNoise * 3.6 + 0.07);
+    const gyroThreshold = Math.max(GYRO_FIRE_MIN, player.gyroNoise * 4.8 + 180);
+    const impulseThreshold = Math.max(ACCEL_FIRE_MIN, player.impulseNoise * 4.2 + 0.13);
     const moderate = player.gyro > gyroThreshold || player.impulse > impulseThreshold;
     const strong = player.gyro > GYRO_FIRE_STRONG || player.impulse > ACCEL_FIRE_STRONG;
 
     if (moderate) {
-      if (!player.motionCandidate || now - player.motionCandidate > MOTION_CONFIRM_MS) {
+      if (!player.motionCandidate || now - player.motionCandidate > MOTION_CONFIRM_MS * 2.2) {
         player.motionCandidate = now;
         player.motionHits = 1;
+        player.motionPeak = Math.max(player.gyro / gyroThreshold, player.impulse / impulseThreshold);
       } else {
         player.motionHits += 1;
+        player.motionPeak = Math.max(
+          player.motionPeak,
+          player.gyro / gyroThreshold,
+          player.impulse / impulseThreshold
+        );
       }
     } else if (player.motionCandidate && now - player.motionCandidate > MOTION_CONFIRM_MS) {
       player.motionCandidate = 0;
       player.motionHits = 0;
+      player.motionPeak = 0;
     }
 
-    if (!(strong || player.motionHits >= 1)) return;
+    const confirmedFlick = (
+      player.motionHits >= MOTION_REQUIRED_HITS &&
+      now - player.motionCandidate >= MOTION_CONFIRM_MS &&
+      player.motionPeak >= 1.18
+    );
+    if (!(strong || confirmedFlick)) return;
 
     player.armed = false;
     player.stableSince = 0;
     player.motionCandidate = 0;
     player.motionHits = 0;
+    player.motionPeak = 0;
     if (now - player.lastShot < SHOT_COOLDOWN_MS) return;
 
     player.lastShot = now;
@@ -312,9 +327,9 @@
         const now = performance.now();
         const force = player.grip == null ? 0 : player.grip - player.baseline;
         peak = Math.max(peak, player.grip || peak);
-        if (force > 55) {
+        if (force > 35) {
           if (!holdStart) holdStart = now;
-        } else if (force < 30) {
+        } else if (force < 18) {
           holdStart = 0;
         }
         const heldMs = holdStart ? now - holdStart : 0;
@@ -338,7 +353,7 @@
     }
 
     player.peak = median(peaks);
-    player.travel = Math.max(player.peak - player.baseline, 120);
+    player.travel = Math.max((player.peak - player.baseline) * 0.65, 80);
     player.tracking = -1;
     emitCalibration(player, "DONE", 100, player.peak);
     await haptic(player, 70, 60);

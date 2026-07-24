@@ -94,6 +94,37 @@
     });
   }
 
+  function isGripball(device) {
+    return device && device.vendorId === VENDOR_ID && device.productId === PRODUCT_ID;
+  }
+
+  async function enrollDevice(device, vibrate = true) {
+    if (!isGripball(device) || playerForDevice(device) || state.players.length >= MAX_PLAYERS) {
+      return false;
+    }
+    if (!device.opened) await device.open();
+    const player = makePlayer(device, state.players.length);
+    device.addEventListener("inputreport", event => parseInput(player, event));
+    state.players.push(player);
+    await stream(player);
+    if (vibrate) await haptic(player, 55, 45);
+    updatePlayerNumbers();
+    emit({type: "player_count", count: state.players.length});
+    return true;
+  }
+
+  function setConnectedStatus(prefix = "已連接") {
+    if (state.players.length > 0) {
+      setStatus(
+        `${prefix} ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}`).join(" / ")}。可繼續新增或開始。`,
+        "waiting"
+      );
+    } else {
+      setStatus("尚未偵測到已授權握力球。若 Chrome 視窗出現 paired，仍需選取一次授權給這個網頁。", "waiting");
+    }
+    refreshUi();
+  }
+
   function estimateGrip(player, grip) {
     player.grip = grip;
     if (player.baseline == null) {
@@ -240,23 +271,36 @@
         filters: [{vendorId: VENDOR_ID, productId: PRODUCT_ID}],
       })).slice(0, MAX_PLAYERS);
       for (const device of gripballs) {
-        if (playerForDevice(device)) continue;
-        if (!device.opened) await device.open();
-        const player = makePlayer(device, state.players.length);
-        device.addEventListener("inputreport", event => parseInput(player, event));
-        state.players.push(player);
-        await stream(player);
-        await haptic(player, 55, 45);
+        await enrollDevice(device, true);
       }
-      updatePlayerNumbers();
-      setStatus(
-        `已連接 ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}`).join(" / ")}。可繼續新增或開始。`,
-        "waiting"
-      );
-      refreshUi();
+      setConnectedStatus("已連接");
     } catch (error) {
       if (error.name !== "NotFoundError") console.error(error);
       setStatus("尚未新增握力球，請再試一次。", "error");
+    }
+  }
+
+  async function restoreAuthorizedDevices() {
+    if (!navigator.hid) {
+      setStatus("此瀏覽器不支援 WebHID，請使用最新版 Chrome 或 Edge。", "error");
+      refreshUi();
+      return;
+    }
+    try {
+      const devices = await navigator.hid.getDevices();
+      let restored = 0;
+      for (const device of devices) {
+        if (!isGripball(device)) continue;
+        try {
+          if (await enrollDevice(device, false)) restored += 1;
+        } catch (error) {
+          console.warn("Authorized Gripball is unavailable", device.productName || device, error);
+        }
+      }
+      setConnectedStatus(restored > 0 ? "已自動恢復" : "已連接");
+    } catch (error) {
+      console.warn("Could not restore authorized Gripballs", error);
+      setConnectedStatus();
     }
   }
 
@@ -399,6 +443,25 @@
     document.getElementById("gripball-connect").addEventListener("click", addDevices);
     document.getElementById("gripball-start").addEventListener("click", startGame);
     refreshUi();
+    restoreAuthorizedDevices();
+  }
+
+  if (navigator.hid) {
+    navigator.hid.addEventListener("disconnect", (event) => {
+      const player = playerForDevice(event.device);
+      if (!player) return;
+      state.players = state.players.filter((item) => item !== player);
+      updatePlayerNumbers();
+      emit({type: "player_count", count: state.players.length});
+      setConnectedStatus("已連接");
+    });
+    navigator.hid.addEventListener("connect", (event) => {
+      if (state.phase === "connect" && isGripball(event.device)) {
+        enrollDevice(event.device, false).then((added) => {
+          if (added) setConnectedStatus("已自動連接");
+        }).catch((error) => console.warn("Could not auto-connect Gripball", error));
+      }
+    });
   }
 
   window.gripballBridge = {

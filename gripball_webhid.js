@@ -17,11 +17,11 @@
 
   const queue = [];
   const state = {
-    devices: [],
     players: [],
     phase: "connect",
     hapticIgnoreUntil: 0,
     readyStarted: 0,
+    lastTrackEmit: 0,
   };
 
   function emit(message) {
@@ -56,6 +56,9 @@
       device,
       playerId,
       grip: null,
+      baseline: null,
+      peakEstimate: null,
+      tracking: -1,
       accelReference: null,
       gyro: 0,
       impulse: 0,
@@ -66,14 +69,51 @@
       gyroNoise: 35,
       impulseNoise: 0.025,
       lastShot: 0,
-      lastDebug: 0,
     };
+  }
+
+  function deviceKey(device) {
+    return device.serialNumber || `${device.vendorId}:${device.productId}:${device.productName}`;
+  }
+
+  function playerForDevice(device) {
+    const key = deviceKey(device);
+    return state.players.find(player => deviceKey(player.device) === key);
+  }
+
+  function updatePlayerNumbers() {
+    state.players.forEach((player, index) => {
+      player.playerId = index;
+    });
+  }
+
+  function estimateGrip(player, grip) {
+    player.grip = grip;
+    if (player.baseline == null) {
+      player.baseline = grip;
+      player.peakEstimate = grip + 2400;
+      return;
+    }
+    const force = grip - player.baseline;
+    const isHolding = force > 550;
+    if (!isHolding) {
+      player.baseline = player.baseline * 0.995 + grip * 0.005;
+    } else {
+      player.peakEstimate = Math.max(player.peakEstimate || grip, grip);
+    }
+    const travel = Math.max((player.peakEstimate || player.baseline + 2400) - player.baseline, 1400);
+    const rawStrength = Math.max(0, Math.min(1, force / travel));
+    const strength = rawStrength > 0.10 ? Math.sqrt(rawStrength) : 0;
+    if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
+      player.tracking = strength;
+      emit({type: "track_player", player: player.playerId, value: strength});
+    }
   }
 
   function parseInput(player, event) {
     const view = event.data;
     if (event.reportId === REPORT_GRIP && view.byteLength >= 4) {
-      player.grip = view.getUint16(2, true);
+      estimateGrip(player, view.getUint16(2, true));
       return;
     }
     if (event.reportId !== REPORT_IMU || view.byteLength < 28) return;
@@ -142,7 +182,7 @@
     player.lastShot = now;
     emit({type: "shoot_player", player: player.playerId});
     haptic(player, 70, 35);
-    setStatus(`P${player.playerId + 1} shot`, "ready");
+    setStatus(`P${player.playerId + 1} fired`, "ready");
   }
 
   function setStatus(text, kind) {
@@ -153,17 +193,12 @@
     }
   }
 
-  function uniqueGripballDevices(devices) {
-    const seen = new Set();
-    const out = [];
-    for (const device of devices) {
-      if (device.vendorId !== VENDOR_ID || device.productId !== PRODUCT_ID) continue;
-      const key = device.serialNumber || `${device.productName}-${out.length}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(device);
-    }
-    return out.slice(0, MAX_PLAYERS);
+  function refreshUi() {
+    const startButton = document.getElementById("gripball-start");
+    if (startButton) startButton.disabled = state.players.length < 1 || state.phase !== "connect";
+    const connectButton = document.getElementById("gripball-connect");
+    if (connectButton) connectButton.style.display = state.phase === "connect" ? "" : "none";
+    if (startButton) startButton.style.display = state.phase === "connect" ? "" : "none";
   }
 
   async function resumeAudioAndFocusCanvas() {
@@ -179,6 +214,36 @@
     canvas.dispatchEvent(new PointerEvent("pointerup", {bubbles: true, pointerId: 1, pointerType: "mouse"}));
   }
 
+  async function addDevices() {
+    if (!navigator.hid) {
+      setStatus("此瀏覽器不支援 WebHID，請使用最新版 Chrome 或 Edge。", "error");
+      return;
+    }
+    try {
+      await resumeAudioAndFocusCanvas();
+      await navigator.hid.requestDevice({filters: [{vendorId: VENDOR_ID, productId: PRODUCT_ID}]});
+      const granted = await navigator.hid.getDevices();
+      const gripballs = granted
+        .filter(device => device.vendorId === VENDOR_ID && device.productId === PRODUCT_ID)
+        .slice(0, MAX_PLAYERS);
+      for (const device of gripballs) {
+        if (playerForDevice(device)) continue;
+        if (!device.opened) await device.open();
+        const player = makePlayer(device, state.players.length);
+        device.addEventListener("inputreport", event => parseInput(player, event));
+        state.players.push(player);
+        await stream(player);
+        await haptic(player, 55, 45);
+      }
+      updatePlayerNumbers();
+      setStatus(`已連接 ${state.players.length} 顆。可繼續連接，或按開始遊戲。`, "waiting");
+      refreshUi();
+    } catch (error) {
+      if (error.name !== "NotFoundError") console.error(error);
+      setStatus("尚未新增握力球，請再試一次。", "error");
+    }
+  }
+
   async function identifyPlayers() {
     for (const player of state.players) {
       for (let i = 0; i <= player.playerId; i += 1) {
@@ -189,54 +254,35 @@
     }
   }
 
-  async function connect() {
-    if (!navigator.hid) {
-      setStatus("此瀏覽器不支援 WebHID，請使用最新版 Chrome 或 Edge。", "error");
-      return;
+  async function startGame() {
+    if (state.players.length < 1 || state.phase !== "connect") return;
+    await resumeAudioAndFocusCanvas();
+    state.phase = "starting";
+    refreshUi();
+    setStatus(`正在標記 ${state.players.length} 顆握力球編號…`, "waiting");
+    await identifyPlayers();
+    state.phase = "play";
+    state.readyStarted = performance.now();
+    emit({type: "player_count", count: state.players.length});
+    emit({type: "calibration_done"});
+    for (const player of state.players) {
+      emit({type: "track_player", player: player.playerId, value: Math.max(0, player.tracking)});
     }
-    try {
-      await resumeAudioAndFocusCanvas();
-      await navigator.hid.requestDevice({filters: [{vendorId: VENDOR_ID, productId: PRODUCT_ID}]});
-      const granted = await navigator.hid.getDevices();
-      const devices = uniqueGripballDevices(granted);
-      if (devices.length < 1) {
-        setStatus("尚未連接握力球，請再試一次。", "error");
-        return;
-      }
-
-      state.players = [];
-      for (const device of devices) {
-        if (!device.opened) await device.open();
-        const player = makePlayer(device, state.players.length);
-        device.addEventListener("inputreport", event => parseInput(player, event));
-        state.players.push(player);
-        await stream(player);
-      }
-
-      document.getElementById("gripball-connect").style.display = "none";
-      setStatus(`已連接 ${state.players.length} 顆握力球，正在標記編號…`, "waiting");
-      await identifyPlayers();
-
-      state.phase = "play";
-      state.readyStarted = performance.now();
-      emit({type: "player_count", count: state.players.length});
-      emit({type: "calibration_done"});
-      setStatus(`Party Mode：${state.players.length} 顆握力球，每顆射自己的鴨子。`, "ready");
-    } catch (error) {
-      if (error.name !== "NotFoundError") console.error(error);
-      setStatus("尚未連接握力球，請再試一次。", "error");
-    }
+    setStatus(`開始！握住追蹤鴨子，甩動才發射。`, "ready");
+    refreshUi();
   }
 
   function installUi() {
     const style = document.createElement("style");
-    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-connect{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}";
+    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}";
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
-    panel.innerHTML = '<button id="gripball-connect">連接握力球</button><span id="gripball-status">請使用 Chrome／Edge，連接一顆或多顆握力球。</span>';
+    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span>';
     document.body.appendChild(panel);
-    document.getElementById("gripball-connect").addEventListener("click", connect);
+    document.getElementById("gripball-connect").addEventListener("click", addDevices);
+    document.getElementById("gripball-start").addEventListener("click", startGame);
+    refreshUi();
   }
 
   window.gripballBridge = {
@@ -248,7 +294,7 @@
       return JSON.stringify(queue.splice(0, queue.length));
     },
     proximity(_intensity) {
-      // Party Mode does not use auto-aim proximity haptics.
+      // Party Mode uses visual timing instead of proximity haptics.
     },
   };
 

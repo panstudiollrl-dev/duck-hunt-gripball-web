@@ -15,21 +15,26 @@
   const CALIBRATION_STEP_TIMEOUT_MS = 15000;
   const CALIBRATION_BASELINE_CREEP = 12;
   const SHOT_COOLDOWN_MS = 1150;
-  const GYRO_FIRE_MIN = 520;
-  const GYRO_FIRE_STRONG = 760;
-  const GYRO_RELEASE = 260;
-  const ACCEL_FIRE_MIN = 0.34;
-  const ACCEL_FIRE_STRONG = 0.52;
-  const ACCEL_RELEASE = 0.16;
-  const MOTION_CONFIRM_MS = 90;
-  const MOTION_REQUIRED_HITS = 3;
+  const MOTION_REARM_MS = 140;
+
+  const TRACK_ENGAGE_MIN = 30;
+  const TRACK_RELEASE_MIN = 15;
+  const TRACK_ENGAGE_RATIO = 0.14;
+  const TRACK_RELEASE_RATIO = 0.07;
+  const GRIP_STALE_MS = 250;
+
+  const SHAKE_REST_MS = 900;
+  const SHAKE_SAMPLE_MS = 2500;
+  const SHAKE_FIRE_RATIO = 0.45;
+  const SHAKE_RELEASE_RATIO = 0.22;
+  const SHAKE_MIN_RANGE = 0.15;
+
   const MAX_PLAYERS = 8;
 
   const queue = [];
   const state = {
     players: [],
     phase: "connect",
-    hapticIgnoreUntil: 0,
     readyStarted: 0,
     lastTrackEmit: 0,
     calibrationStarted: 0,
@@ -59,7 +64,7 @@
     if (!player) return;
     const data = new Uint8Array([3, 6, 0, 1, intensity, duration]);
     await command(player.device, 11, data);
-    state.hapticIgnoreUntil = performance.now() + 180;
+    player.hapticIgnoreUntil = performance.now() + 180;
   }
 
   function makePlayer(device, playerId) {
@@ -71,16 +76,17 @@
       peak: null,
       travel: 900,
       tracking: -1,
-      accelReference: null,
-      gyro: 0,
-      impulse: 0,
+      holding: false,
+      gripNoise: 0,
+      lastGripAt: 0,
+      accel: null,
+      accelRest: null,
+      accelPeak: null,
+      fireThreshold: null,
+      fireRelease: null,
       armed: false,
       stableSince: 0,
-      motionCandidate: 0,
-      motionHits: 0,
-      motionPeak: 0,
-      gyroNoise: 35,
-      impulseNoise: 0.025,
+      hapticIgnoreUntil: 0,
       lastShot: 0,
     };
   }
@@ -138,12 +144,18 @@
       return;
     }
     const force = grip - player.baseline;
-    const isHolding = force > Math.max(28, player.travel * 0.045);
-    if (state.phase === "play" && !isHolding) {
-      player.baseline = player.baseline * 0.995 + grip * 0.005;
+    const engageForce = Math.max(TRACK_ENGAGE_MIN, player.travel * TRACK_ENGAGE_RATIO);
+    const releaseForce = Math.max(TRACK_RELEASE_MIN, player.travel * TRACK_RELEASE_RATIO);
+    if (player.holding) {
+      if (force < releaseForce) player.holding = false;
+    } else if (force >= engageForce) {
+      player.holding = true;
+    }
+    if (state.phase === "play" && !player.holding && force < releaseForce) {
+      player.baseline = player.baseline * 0.997 + grip * 0.003;
     }
     const rawStrength = Math.max(0, Math.min(1, force / Math.max(player.travel, 80)));
-    const strength = force > Math.max(20, player.travel * 0.03) ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
+    const strength = player.holding ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
     if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
       player.tracking = strength;
       emit({type: "track_player", player: player.playerId, value: strength});
@@ -153,6 +165,7 @@
   function parseInput(player, event) {
     const view = event.data;
     if (event.reportId === REPORT_GRIP && view.byteLength >= 4) {
+      player.lastGripAt = performance.now();
       estimateGrip(player, view.getUint16(2, true));
       return;
     }
@@ -161,75 +174,31 @@
     const ax = view.getFloat32(4, true);
     const ay = view.getFloat32(8, true);
     const az = view.getFloat32(12, true);
-    const gx = view.getFloat32(16, true);
-    const gy = view.getFloat32(20, true);
-    const gz = view.getFloat32(24, true);
-    const gyro = Math.hypot(gx, gy, gz);
-    const accel = Math.hypot(ax, ay, az);
-    if (player.accelReference == null) player.accelReference = Math.max(accel, 0.001);
-    const impulse = Math.abs(accel - player.accelReference) / Math.max(player.accelReference, 0.001);
-    if (gyro < 260 && impulse < 0.18) {
-      player.accelReference = player.accelReference * 0.995 + accel * 0.005;
-    }
-    player.gyro = gyro;
-    player.impulse = impulse;
-    if (state.phase === "play" && performance.now() >= state.hapticIgnoreUntil) {
-      if (gyro < 240 && impulse < 0.14) {
-        player.gyroNoise = player.gyroNoise * 0.985 + gyro * 0.015;
-        player.impulseNoise = player.impulseNoise * 0.985 + impulse * 0.015;
-      }
+    player.accel = Math.hypot(ax, ay, az);
+
+    if (state.phase === "play" && performance.now() >= player.hapticIgnoreUntil) {
       updateMotion(player);
     }
   }
 
   function updateMotion(player) {
+    if (player.fireThreshold == null || player.accel == null) return;
     const now = performance.now();
+
     if (!player.armed) {
-      if (player.gyro < GYRO_RELEASE && player.impulse < ACCEL_RELEASE) {
+      if (player.accel < player.fireRelease) {
         if (!player.stableSince) player.stableSince = now;
-        if (now - player.stableSince >= 180) player.armed = true;
+        if (now - player.stableSince >= MOTION_REARM_MS) player.armed = true;
       } else {
         player.stableSince = 0;
       }
       return;
     }
 
-    const gyroThreshold = Math.max(GYRO_FIRE_MIN, player.gyroNoise * 4.8 + 180);
-    const impulseThreshold = Math.max(ACCEL_FIRE_MIN, player.impulseNoise * 4.2 + 0.13);
-    const moderate = player.gyro > gyroThreshold || player.impulse > impulseThreshold;
-    const strong = player.gyro > GYRO_FIRE_STRONG || player.impulse > ACCEL_FIRE_STRONG;
-
-    if (moderate) {
-      if (!player.motionCandidate || now - player.motionCandidate > MOTION_CONFIRM_MS * 2.2) {
-        player.motionCandidate = now;
-        player.motionHits = 1;
-        player.motionPeak = Math.max(player.gyro / gyroThreshold, player.impulse / impulseThreshold);
-      } else {
-        player.motionHits += 1;
-        player.motionPeak = Math.max(
-          player.motionPeak,
-          player.gyro / gyroThreshold,
-          player.impulse / impulseThreshold
-        );
-      }
-    } else if (player.motionCandidate && now - player.motionCandidate > MOTION_CONFIRM_MS) {
-      player.motionCandidate = 0;
-      player.motionHits = 0;
-      player.motionPeak = 0;
-    }
-
-    const confirmedFlick = (
-      player.motionHits >= MOTION_REQUIRED_HITS &&
-      now - player.motionCandidate >= MOTION_CONFIRM_MS &&
-      player.motionPeak >= 1.18
-    );
-    if (!(strong || confirmedFlick)) return;
+    if (player.accel < player.fireThreshold) return;
 
     player.armed = false;
     player.stableSince = 0;
-    player.motionCandidate = 0;
-    player.motionHits = 0;
-    player.motionPeak = 0;
     if (now - player.lastShot < SHOT_COOLDOWN_MS) return;
 
     player.lastShot = now;
@@ -424,13 +393,73 @@
     }
   }
 
+  async function calibrateShake(player) {
+    const restSamples = [];
+    const restStart = performance.now();
+    let lastUi = 0;
+    while (performance.now() - restStart < SHAKE_REST_MS) {
+      if (player.accel != null) restSamples.push(player.accel);
+      if (performance.now() - lastUi > 90) {
+        emitCalibration(player, "HOLD STILL - DO NOT SHAKE", 0);
+        lastUi = performance.now();
+      }
+      await sleep(25);
+    }
+    if (!restSamples.length) {
+      throw new Error(`P${player.playerId + 1} 沒有加速度資料`);
+    }
+    const rest = median(restSamples);
+    player.accelRest = rest;
+
+    await haptic(player, 60, 45);
+    let peak = rest;
+    const shakeStart = performance.now();
+    lastUi = 0;
+    while (performance.now() - shakeStart < SHAKE_SAMPLE_MS) {
+      const now = performance.now();
+      if (player.accel != null && now >= player.hapticIgnoreUntil) {
+        peak = Math.max(peak, player.accel);
+      }
+      if (now - lastUi > 90) {
+        const left = (SHAKE_SAMPLE_MS - (now - shakeStart)) / 1000;
+        emitCalibration(
+          player,
+          `SHAKE NOW ${left.toFixed(1)}s (peak ${peak.toFixed(2)})`,
+          (now - shakeStart) / SHAKE_SAMPLE_MS * 100
+        );
+        lastUi = now;
+      }
+      await sleep(20);
+    }
+
+    if (peak < rest * (1 + SHAKE_MIN_RANGE)) {
+      throw new Error(
+        `P${player.playerId + 1} 甩動幅度不足（靜止 ${rest.toFixed(2)}，最高 ${peak.toFixed(2)}）`
+      );
+    }
+
+    const range = peak - rest;
+    player.accelPeak = peak;
+    player.fireThreshold = rest + range * SHAKE_FIRE_RATIO;
+    player.fireRelease = rest + range * SHAKE_RELEASE_RATIO;
+    player.armed = false;
+    player.stableSince = 0;
+    emitCalibration(
+      player,
+      `SHAKE OK (fire ${player.fireThreshold.toFixed(2)})`,
+      100
+    );
+    await haptic(player, 70, 60);
+    await sleep(250);
+  }
+
   async function calibratePlayer(player) {
     await haptic(player, 45, 40);
     const hasGrip = await waitForGrip(player);
     if (!hasGrip) {
       throw new Error(`P${player.playerId + 1} has no grip data`);
     }
-    await collectReleasedBaseline(player, "RELAX - DO NOT PRESS", 0);
+    await collectReleasedBaseline(player, "HOLD BALL - DO NOT PRESS", 0);
 
     const peaks = [];
     for (let round = 1; round <= CALIBRATION_ROUNDS; round += 1) {
@@ -489,6 +518,10 @@
     player.peak = median(peaks);
     player.travel = Math.max((player.peak - player.baseline) * 0.65, 80);
     player.tracking = -1;
+    player.holding = false;
+
+    await calibrateShake(player);
+
     emitCalibration(player, "DONE", 100, player.peak);
     await haptic(player, 70, 60);
     await sleep(300);
@@ -562,9 +595,19 @@
 
   window.gripballBridge = {
     poll() {
-      if (state.phase === "play" && performance.now() - state.readyStarted < 4000) {
-        emit({type: "player_count", count: state.players.length});
-        emit({type: "calibration_done"});
+      const now = performance.now();
+      if (state.phase === "play") {
+        for (const player of state.players) {
+          if (player.tracking > 0 && now - player.lastGripAt > GRIP_STALE_MS) {
+            player.holding = false;
+            player.tracking = 0;
+            emit({type: "track_player", player: player.playerId, value: 0});
+          }
+        }
+        if (now - state.readyStarted < 4000) {
+          emit({type: "player_count", count: state.players.length});
+          emit({type: "calibration_done"});
+        }
       }
       return JSON.stringify(queue.splice(0, queue.length));
     },

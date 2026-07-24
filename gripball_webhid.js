@@ -37,19 +37,22 @@
 
   const MAX_PLAYERS = 8;
 
-  const TUNING_KEY = "gripball-tuning-v1";
+  const TUNING_KEY = "gripball-tuning-v2";
   const TUNING_DEFAULTS = {
-    trackEngage: 0.14,
-    trackRelease: 0.07,
-    fireRatio: 0.45,
+    engageForce: 60,
+    releaseForce: 25,
+    fullForce: 400,
+    fireAccel: 26,
     cooldownMs: 1150,
   };
   const TUNING_FIELDS = [
-    {key: "trackEngage", label: "追蹤啟動", min: 0.02, max: 0.60, step: 0.01},
-    {key: "trackRelease", label: "追蹤放開", min: 0.01, max: 0.50, step: 0.01},
-    {key: "fireRatio", label: "甩動開槍", min: 0.10, max: 1.00, step: 0.01},
-    {key: "cooldownMs", label: "開槍冷卻", min: 200, max: 2000, step: 50},
+    {key: "engageForce", label: "追蹤啟動", unit: "力", min: 5, max: 900, step: 5},
+    {key: "releaseForce", label: "追蹤放開", unit: "力", min: 2, max: 900, step: 5},
+    {key: "fullForce", label: "追蹤全速", unit: "力", min: 40, max: 4000, step: 20},
+    {key: "fireAccel", label: "甩動開槍", unit: "甩", min: 10, max: 90, step: 0.5},
+    {key: "cooldownMs", label: "開槍冷卻", unit: "ms", min: 200, max: 2000, step: 50},
   ];
+  let tuningTouched = false;
   const tuning = Object.assign({}, TUNING_DEFAULTS);
 
   function loadTuning() {
@@ -58,7 +61,10 @@
       if (!raw) return;
       const saved = JSON.parse(raw);
       for (const key of Object.keys(TUNING_DEFAULTS)) {
-        if (typeof saved[key] === "number" && isFinite(saved[key])) tuning[key] = saved[key];
+        if (typeof saved[key] === "number" && isFinite(saved[key])) {
+          tuning[key] = saved[key];
+          tuningTouched = true;
+        }
       }
     } catch (error) {
       console.warn("Could not load gripball tuning", error);
@@ -73,15 +79,30 @@
     }
   }
 
-  function applyFireThreshold(player) {
-    if (player.accelRest == null || player.accelPeak == null) return;
-    const range = player.accelPeak - player.accelRest;
-    player.fireThreshold = player.accelRest + range * tuning.fireRatio;
-    player.fireRelease = player.accelRest + range * Math.min(0.22, tuning.fireRatio * 0.5);
+  function fireRelease(player) {
+    const rest = player.accelRest == null ? tuning.fireAccel * 0.4 : player.accelRest;
+    if (tuning.fireAccel <= rest) return tuning.fireAccel * 0.9;
+    return rest + (tuning.fireAccel - rest) * 0.45;
+  }
+
+  function suggestFromCalibration() {
+    const travels = state.players.map((p) => p.travel).filter((v) => v > 0);
+    if (travels.length) {
+      const travel = Math.min(...travels);
+      tuning.fullForce = Math.round(travel);
+      tuning.engageForce = Math.round(Math.max(10, travel * 0.14));
+      tuning.releaseForce = Math.round(Math.max(5, travel * 0.07));
+    }
+    const peaks = state.players.filter((p) => p.accelRest != null && p.accelPeak != null);
+    if (peaks.length) {
+      const rest = median(peaks.map((p) => p.accelRest));
+      const peak = median(peaks.map((p) => p.accelPeak));
+      tuning.fireAccel = Math.round((rest + (peak - rest) * 0.45) * 2) / 2;
+    }
   }
 
   function applyTuning() {
-    for (const player of state.players) applyFireThreshold(player);
+    tuningTouched = true;
     saveTuning();
     refreshTuningUi();
   }
@@ -211,9 +232,8 @@
       return;
     }
     const force = grip - player.baseline;
-    const releaseRatio = Math.min(tuning.trackRelease, tuning.trackEngage * 0.8);
-    const engageForce = Math.max(TRACK_ENGAGE_MIN, player.travel * tuning.trackEngage);
-    const releaseForce = Math.max(TRACK_RELEASE_MIN, player.travel * releaseRatio);
+    const engageForce = tuning.engageForce;
+    const releaseForce = Math.min(tuning.releaseForce, engageForce * 0.9);
     const now = performance.now();
     if (player.holding) {
       if (force < releaseForce) {
@@ -254,7 +274,7 @@
     if (state.phase === "play" && !player.holding) {
       player.baseline = player.baseline * 0.995 + grip * 0.005;
     }
-    const rawStrength = Math.max(0, Math.min(1, force / Math.max(player.travel, 80)));
+    const rawStrength = Math.max(0, Math.min(1, force / Math.max(tuning.fullForce, 20)));
     const strength = player.holding ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
     if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
       player.tracking = strength;
@@ -282,11 +302,12 @@
   }
 
   function updateMotion(player) {
-    if (player.fireThreshold == null || player.accel == null) return;
+    if (player.accel == null) return;
     const now = performance.now();
+    const release = fireRelease(player);
 
     if (!player.armed) {
-      if (player.accel < player.fireRelease) {
+      if (player.accel < release) {
         if (!player.stableSince) player.stableSince = now;
         if (now - player.stableSince >= MOTION_REARM_MS) player.armed = true;
       } else {
@@ -295,7 +316,7 @@
       return;
     }
 
-    if (player.accel < player.fireThreshold) return;
+    if (player.accel < tuning.fireAccel) return;
 
     player.armed = false;
     player.stableSince = 0;
@@ -537,12 +558,11 @@
     }
 
     player.accelPeak = peak;
-    applyFireThreshold(player);
     player.armed = false;
     player.stableSince = 0;
     emitCalibration(
       player,
-      `SHAKE OK (fire ${player.fireThreshold.toFixed(2)})`,
+      `SHAKE OK (rest ${rest.toFixed(2)} peak ${peak.toFixed(2)})`,
       100
     );
     await haptic(player, 70, 60);
@@ -642,6 +662,11 @@
       await calibratePlayer(player);
     }
     await settleAllPlayers();
+    if (!tuningTouched) {
+      suggestFromCalibration();
+      saveTuning();
+    }
+    refreshTuningUi();
   }
 
   async function startGame() {
@@ -672,27 +697,23 @@
   function refreshTuningUi() {
     for (const field of TUNING_FIELDS) {
       const slider = document.getElementById(`gt-${field.key}`);
-      const readout = document.getElementById(`gt-${field.key}-value`);
-      if (slider && Number(slider.value) !== tuning[field.key]) slider.value = tuning[field.key];
-      if (!readout) continue;
-      if (field.key === "cooldownMs") {
-        readout.textContent = `${Math.round(tuning[field.key])} ms`;
-        continue;
+      const box = document.getElementById(`gt-${field.key}-box`);
+      const value = tuning[field.key];
+      if (slider && Number(slider.value) !== value) {
+        slider.value = Math.min(field.max, Math.max(field.min, value));
       }
-      const player = state.players[0];
-      let derived = "";
-      if (player) {
-        if (field.key === "trackEngage") {
-          derived = ` → 力 ${Math.round(Math.max(TRACK_ENGAGE_MIN, player.travel * tuning.trackEngage))}`;
-        } else if (field.key === "trackRelease") {
-          const ratio = Math.min(tuning.trackRelease, tuning.trackEngage * 0.8);
-          derived = ` → 力 ${Math.round(Math.max(TRACK_RELEASE_MIN, player.travel * ratio))}`;
-        } else if (field.key === "fireRatio" && player.fireThreshold != null) {
-          derived = ` → 甩 ${player.fireThreshold.toFixed(2)}`;
-        }
+      if (box && document.activeElement !== box && Number(box.value) !== value) {
+        box.value = value;
       }
-      readout.textContent = tuning[field.key].toFixed(2) + derived;
     }
+  }
+
+  function setTuning(key, raw) {
+    const field = TUNING_FIELDS.find((item) => item.key === key);
+    const value = Number(raw);
+    if (!field || !isFinite(value)) return;
+    tuning[key] = value;
+    applyTuning();
   }
 
   function installTuningUi() {
@@ -701,11 +722,14 @@
     const rows = TUNING_FIELDS.map((field) => (
       `<label><span>${field.label}</span>` +
       `<input type="range" id="gt-${field.key}" min="${field.min}" max="${field.max}" step="${field.step}">` +
-      `<b id="gt-${field.key}-value"></b></label>`
+      `<input type="number" id="gt-${field.key}-box" step="${field.step}">` +
+      `<i>${field.unit}</i></label>`
     )).join("");
     panel.innerHTML =
       `<button id="gt-toggle">靈敏度設定</button>` +
-      `<div id="gt-body">${rows}<button id="gt-reset">重設為預設值</button></div>`;
+      `<div id="gt-body">${rows}` +
+      `<button id="gt-import">從校正帶入</button>` +
+      `<button id="gt-reset">重設為預設值</button></div>`;
     document.body.appendChild(panel);
 
     document.getElementById("gt-toggle").addEventListener("click", () => {
@@ -717,18 +741,22 @@
       Object.assign(tuning, TUNING_DEFAULTS);
       applyTuning();
     });
+    document.getElementById("gt-import").addEventListener("click", () => {
+      suggestFromCalibration();
+      applyTuning();
+    });
     for (const field of TUNING_FIELDS) {
-      document.getElementById(`gt-${field.key}`).addEventListener("input", (event) => {
-        tuning[field.key] = Number(event.target.value);
-        applyTuning();
-      });
+      document.getElementById(`gt-${field.key}`)
+        .addEventListener("input", (event) => setTuning(field.key, event.target.value));
+      document.getElementById(`gt-${field.key}-box`)
+        .addEventListener("change", (event) => setTuning(field.key, event.target.value));
     }
     refreshTuningUi();
   }
 
   function installUi() {
     const style = document.createElement("style");
-    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input{flex:1}#gt-body label b{width:96px;flex:none;text-align:right;font-weight:500;font-variant-numeric:tabular-nums}#gt-reset{width:100%;margin-top:2px}";
+    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
@@ -788,9 +816,9 @@
             state.players.map((player) => {
               const force = player.grip == null || player.baseline == null
                 ? 0 : Math.round(player.grip - player.baseline);
-              const engage = Math.round(Math.max(TRACK_ENGAGE_MIN, player.travel * tuning.trackEngage));
+              const engage = Math.round(tuning.engageForce);
               const accel = player.accel == null ? 0 : player.accel;
-              const fire = player.fireThreshold == null ? 0 : player.fireThreshold;
+              const fire = tuning.fireAccel;
               const raw = player.grip == null ? "--" : Math.round(player.grip);
               return `P${player.playerId + 1} ${player.holding ? "握" : "放"} raw${raw}` +
                 ` 力${force}/${engage} 甩${accel.toFixed(2)}/${fire.toFixed(2)}`;

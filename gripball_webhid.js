@@ -6,13 +6,13 @@
   const REPORT_IMU = 3;
   const REPORT_GRIP = 5;
   const SHOT_COOLDOWN_MS = 800;
-  const GYRO_FIRE_MIN = 360;
-  const GYRO_FIRE_STRONG = 650;
-  const GYRO_RELEASE = 240;
-  const ACCEL_FIRE_MIN = 0.22;
-  const ACCEL_FIRE_STRONG = 0.44;
-  const ACCEL_RELEASE = 0.12;
-  const MOTION_CONFIRM_MS = 95;
+  const GYRO_FIRE_MIN = 260;
+  const GYRO_FIRE_STRONG = 480;
+  const GYRO_RELEASE = 190;
+  const ACCEL_FIRE_MIN = 0.16;
+  const ACCEL_FIRE_STRONG = 0.30;
+  const ACCEL_RELEASE = 0.09;
+  const MOTION_CONFIRM_MS = 55;
   const MAX_PLAYERS = 8;
 
   const queue = [];
@@ -92,19 +92,20 @@
     player.grip = grip;
     if (player.baseline == null) {
       player.baseline = grip;
-      player.peakEstimate = grip + 2400;
+      player.peakEstimate = grip + 1200;
       return;
     }
     const force = grip - player.baseline;
-    const isHolding = force > 550;
+    const isHolding = force > 180;
     if (!isHolding) {
       player.baseline = player.baseline * 0.995 + grip * 0.005;
     } else {
       player.peakEstimate = Math.max(player.peakEstimate || grip, grip);
     }
-    const travel = Math.max((player.peakEstimate || player.baseline + 2400) - player.baseline, 1400);
+    player.peakEstimate = Math.max(player.peakEstimate || grip, player.baseline + 900);
+    const travel = Math.max((player.peakEstimate || player.baseline + 1200) - player.baseline, 700);
     const rawStrength = Math.max(0, Math.min(1, force / travel));
-    const strength = rawStrength > 0.10 ? Math.sqrt(rawStrength) : 0;
+    const strength = force > 130 ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
     if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
       player.tracking = strength;
       emit({type: "track_player", player: player.playerId, value: strength});
@@ -135,7 +136,7 @@
     player.gyro = gyro;
     player.impulse = impulse;
     if (state.phase === "play" && performance.now() >= state.hapticIgnoreUntil) {
-      if (gyro < 220 && impulse < 0.16) {
+      if (gyro < 180 && impulse < 0.13) {
         player.gyroNoise = player.gyroNoise * 0.985 + gyro * 0.015;
         player.impulseNoise = player.impulseNoise * 0.985 + impulse * 0.015;
       }
@@ -155,8 +156,8 @@
       return;
     }
 
-    const gyroThreshold = Math.max(GYRO_FIRE_MIN, player.gyroNoise * 5.5 + 150);
-    const impulseThreshold = Math.max(ACCEL_FIRE_MIN, player.impulseNoise * 5.0 + 0.10);
+    const gyroThreshold = Math.max(GYRO_FIRE_MIN, player.gyroNoise * 4.0 + 110);
+    const impulseThreshold = Math.max(ACCEL_FIRE_MIN, player.impulseNoise * 3.6 + 0.07);
     const moderate = player.gyro > gyroThreshold || player.impulse > impulseThreshold;
     const strong = player.gyro > GYRO_FIRE_STRONG || player.impulse > ACCEL_FIRE_STRONG;
 
@@ -172,7 +173,7 @@
       player.motionHits = 0;
     }
 
-    if (!(strong || player.motionHits >= 2)) return;
+    if (!(strong || player.motionHits >= 1)) return;
 
     player.armed = false;
     player.stableSince = 0;
@@ -237,7 +238,10 @@
         await haptic(player, 55, 45);
       }
       updatePlayerNumbers();
-      setStatus(`已連接 ${state.players.length} 顆。可繼續連接，或按開始遊戲。`, "waiting");
+      setStatus(
+        `已連接 ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}`).join(" / ")}。可繼續新增或開始。`,
+        "waiting"
+      );
       refreshUi();
     } catch (error) {
       if (error.name !== "NotFoundError") console.error(error);

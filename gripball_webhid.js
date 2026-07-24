@@ -773,11 +773,11 @@
 
   function installUi() {
     const style = document.createElement("style");
-    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status{cursor:pointer}#gripball-show{position:fixed;z-index:99999;right:12px;top:12px;display:none;border:0;border-radius:7px;padding:5px 9px;background:#111a;color:#fff9;font:12px system-ui;cursor:pointer}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
+    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status{cursor:pointer}#gripball-webhid button#gripball-hide{background:#0000;color:#fff9;font-size:17px;font-weight:400;line-height:1;padding:2px 4px 4px;margin-left:2px}#gripball-webhid button#gripball-hide:hover{color:#fff}#gripball-show{position:fixed;z-index:99999;right:12px;top:12px;display:none;border:0;border-radius:7px;padding:5px 9px;background:#111a;color:#fff9;font:12px system-ui;cursor:pointer}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
-    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span>';
+    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
     document.body.appendChild(panel);
     const dot = document.createElement("button");
     dot.id = "gripball-show";
@@ -785,6 +785,10 @@
     dot.title = "顯示即時數值";
     document.body.appendChild(dot);
     dot.addEventListener("click", () => setHudHidden(false));
+    document.getElementById("gripball-hide").addEventListener("click", (event) => {
+      event.stopPropagation();
+      setHudHidden(true);
+    });
     document.getElementById("gripball-status").addEventListener("click", () => setHudHidden(true));
     try {
       setHudHidden(window.localStorage.getItem(HUD_KEY) === "1");

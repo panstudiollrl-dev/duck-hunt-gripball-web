@@ -10,6 +10,10 @@
   const CALIBRATION_RELEASE_MS = 650;
   const CALIBRATION_SAMPLE_MS = 1200;
   const CALIBRATION_MIN_PRESS_FORCE = 85;
+  const CALIBRATION_MAX_PRESS_FORCE = 220;
+  const CALIBRATION_DIP_GRACE_MS = 260;
+  const CALIBRATION_STEP_TIMEOUT_MS = 15000;
+  const CALIBRATION_BASELINE_CREEP = 12;
   const SHOT_COOLDOWN_MS = 1150;
   const GYRO_FIRE_MIN = 520;
   const GYRO_FIRE_STRONG = 760;
@@ -381,10 +385,16 @@
 
   async function waitForReleased(player, round, progress) {
     const samples = [];
+    const started = performance.now();
     let releaseStart = 0;
     let lastUi = 0;
     while (true) {
       const now = performance.now();
+      if (now - started > CALIBRATION_STEP_TIMEOUT_MS) {
+        throw new Error(
+          `P${player.playerId + 1} 偵測不到放開（raw ${Math.round(player.grip)} / base ${Math.round(player.baseline)}）`
+        );
+      }
       if (player.grip != null) {
         samples.push(player.grip);
         while (samples.length > 35) samples.shift();
@@ -392,7 +402,9 @@
         const noise = medianAbsoluteDeviation(samples, candidateBaseline);
         const stableWindow = Math.max(...samples) - Math.min(...samples);
         if (samples.length >= 12 && stableWindow < Math.max(45, noise * 8 + 18)) {
-          player.baseline = candidateBaseline;
+          if (player.baseline == null || candidateBaseline < player.baseline + CALIBRATION_BASELINE_CREEP) {
+            player.baseline = candidateBaseline;
+          }
           player.gripNoise = noise;
         }
       }
@@ -429,23 +441,38 @@
       let peak = player.grip || player.baseline;
       let peakForce = 0;
       let lastUi = 0;
-      const pressThreshold = Math.max(CALIBRATION_MIN_PRESS_FORCE, (player.gripNoise || 0) * 8 + 55);
+      const pressThreshold = Math.min(
+        CALIBRATION_MAX_PRESS_FORCE,
+        Math.max(CALIBRATION_MIN_PRESS_FORCE, (player.gripNoise || 0) * 8 + 55)
+      );
       const resetThreshold = Math.max(35, pressThreshold * 0.58);
+      const pressStarted = performance.now();
+      let dipStart = 0;
       while (true) {
         const now = performance.now();
+        if (now - pressStarted > CALIBRATION_STEP_TIMEOUT_MS) {
+          throw new Error(
+            `P${player.playerId + 1} 按壓不足（需 ${Math.round(pressThreshold)}，最高 ${Math.round(peakForce)}）`
+          );
+        }
         const force = player.grip == null ? 0 : player.grip - player.baseline;
         peak = Math.max(peak, player.grip || peak);
         peakForce = Math.max(peakForce, force);
         if (force >= pressThreshold) {
           if (!holdStart) holdStart = now;
+          dipStart = 0;
         } else if (force < resetThreshold) {
-          holdStart = 0;
+          if (!dipStart) dipStart = now;
+          if (now - dipStart > CALIBRATION_DIP_GRACE_MS) {
+            holdStart = 0;
+            dipStart = 0;
+          }
         }
         const heldMs = holdStart ? now - holdStart : 0;
         if (now - lastUi > 90) {
           emitCalibration(
             player,
-            `PRESS ${round}/${CALIBRATION_ROUNDS} ${Math.min(heldMs / 1000, 1.5).toFixed(1)}/1.5s`,
+            `PRESS ${round}/${CALIBRATION_ROUNDS} ${Math.min(heldMs / 1000, 1.5).toFixed(1)}/1.5s (need ${Math.round(pressThreshold)})`,
             ((round - 1) + Math.min(heldMs / CALIBRATION_HOLD_MS, 1)) / CALIBRATION_ROUNDS * 100,
             peak
           );

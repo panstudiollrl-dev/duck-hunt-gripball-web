@@ -7,6 +7,9 @@
   const REPORT_GRIP = 5;
   const CALIBRATION_ROUNDS = 3;
   const CALIBRATION_HOLD_MS = 1500;
+  const CALIBRATION_RELEASE_MS = 650;
+  const CALIBRATION_SAMPLE_MS = 1200;
+  const CALIBRATION_MIN_PRESS_FORCE = 85;
   const SHOT_COOLDOWN_MS = 1150;
   const GYRO_FIRE_MIN = 520;
   const GYRO_FIRE_STRONG = 760;
@@ -319,6 +322,11 @@
     return sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
   }
 
+  function medianAbsoluteDeviation(values, center) {
+    if (!values.length) return 0;
+    return median(values.map((value) => Math.abs(value - center)));
+  }
+
   function emitCalibration(player, text, progress, peak) {
     emit({
       type: "calibration",
@@ -349,31 +357,88 @@
     return player.grip != null;
   }
 
+  async function collectReleasedBaseline(player, text, progress) {
+    const samples = [];
+    const start = performance.now();
+    let lastUi = 0;
+    while (performance.now() - start < CALIBRATION_SAMPLE_MS) {
+      if (player.grip != null) samples.push(player.grip);
+      if (performance.now() - lastUi > 90) {
+        const tempBaseline = samples.length ? median(samples) : player.baseline;
+        if (tempBaseline != null) player.baseline = tempBaseline;
+        emitCalibration(player, text, progress);
+        lastUi = performance.now();
+      }
+      await sleep(30);
+    }
+    if (samples.length) {
+      player.baseline = median(samples);
+      player.gripNoise = medianAbsoluteDeviation(samples, player.baseline);
+    } else {
+      player.gripNoise = 0;
+    }
+  }
+
+  async function waitForReleased(player, round, progress) {
+    const samples = [];
+    let releaseStart = 0;
+    let lastUi = 0;
+    while (true) {
+      const now = performance.now();
+      if (player.grip != null) {
+        samples.push(player.grip);
+        while (samples.length > 35) samples.shift();
+        const candidateBaseline = median(samples);
+        const noise = medianAbsoluteDeviation(samples, candidateBaseline);
+        const stableWindow = Math.max(...samples) - Math.min(...samples);
+        if (samples.length >= 12 && stableWindow < Math.max(45, noise * 8 + 18)) {
+          player.baseline = candidateBaseline;
+          player.gripNoise = noise;
+        }
+      }
+      const force = player.grip == null || player.baseline == null ? 999 : Math.abs(player.grip - player.baseline);
+      const releaseThreshold = Math.max(28, (player.gripNoise || 0) * 5 + 12);
+      if (force <= releaseThreshold) {
+        if (!releaseStart) releaseStart = now;
+      } else {
+        releaseStart = 0;
+      }
+      if (now - lastUi > 90) {
+        emitCalibration(player, `RELEASE BEFORE ${round}/${CALIBRATION_ROUNDS}`, progress);
+        lastUi = now;
+      }
+      if (releaseStart && now - releaseStart >= CALIBRATION_RELEASE_MS) break;
+      await sleep(25);
+    }
+  }
+
   async function calibratePlayer(player) {
     await haptic(player, 45, 40);
-    await waitForGrip(player);
-    const baselineSamples = [];
-    const baselineStart = performance.now();
-    while (performance.now() - baselineStart < 1000) {
-      if (player.grip != null) baselineSamples.push(player.grip);
-      emitCalibration(player, "RELAX", Math.min((performance.now() - baselineStart) / 1000 * 100, 100));
-      await sleep(80);
+    const hasGrip = await waitForGrip(player);
+    if (!hasGrip) {
+      throw new Error(`P${player.playerId + 1} has no grip data`);
     }
-    player.baseline = median(baselineSamples) || player.grip || 0;
+    await collectReleasedBaseline(player, "RELAX - DO NOT PRESS", 0);
 
     const peaks = [];
     for (let round = 1; round <= CALIBRATION_ROUNDS; round += 1) {
+      const baseProgress = (round - 1) / CALIBRATION_ROUNDS * 100;
+      await waitForReleased(player, round, baseProgress);
       await haptic(player, 60, 45);
       let holdStart = 0;
-      let peak = player.baseline;
+      let peak = player.grip || player.baseline;
+      let peakForce = 0;
       let lastUi = 0;
+      const pressThreshold = Math.max(CALIBRATION_MIN_PRESS_FORCE, (player.gripNoise || 0) * 8 + 55);
+      const resetThreshold = Math.max(35, pressThreshold * 0.58);
       while (true) {
         const now = performance.now();
         const force = player.grip == null ? 0 : player.grip - player.baseline;
         peak = Math.max(peak, player.grip || peak);
-        if (force > 35) {
+        peakForce = Math.max(peakForce, force);
+        if (force >= pressThreshold) {
           if (!holdStart) holdStart = now;
-        } else if (force < 18) {
+        } else if (force < resetThreshold) {
           holdStart = 0;
         }
         const heldMs = holdStart ? now - holdStart : 0;
@@ -386,14 +451,12 @@
           );
           lastUi = now;
         }
-        if (heldMs >= CALIBRATION_HOLD_MS) break;
+        if (heldMs >= CALIBRATION_HOLD_MS && peakForce >= pressThreshold) break;
         await sleep(20);
       }
       peaks.push(peak);
-      emitCalibration(player, `RELEASE ${round}/${CALIBRATION_ROUNDS}`, round / CALIBRATION_ROUNDS * 100, peak);
+      emitCalibration(player, `RECORDED ${round}/${CALIBRATION_ROUNDS}`, round / CALIBRATION_ROUNDS * 100, peak);
       await haptic(player, 35, 25);
-      const releaseStart = performance.now();
-      while (performance.now() - releaseStart < 500) await sleep(20);
     }
 
     player.peak = median(peaks);
@@ -415,20 +478,26 @@
 
   async function startGame() {
     if (state.players.length < 1 || state.phase !== "connect") return;
-    await resumeAudioAndFocusCanvas();
-    setStatus(`準備校正 ${state.players.length} 顆握力球…`, "waiting");
-    await calibrateAllPlayers();
-    state.phase = "starting";
-    setStatus(`正在標記 ${state.players.length} 顆握力球編號…`, "waiting");
-    await identifyPlayers();
-    state.phase = "play";
-    state.readyStarted = performance.now();
-    emit({type: "player_count", count: state.players.length});
-    emit({type: "calibration_done"});
-    for (const player of state.players) {
-      emit({type: "track_player", player: player.playerId, value: Math.max(0, player.tracking)});
+    try {
+      await resumeAudioAndFocusCanvas();
+      setStatus(`準備校正 ${state.players.length} 顆握力球…`, "waiting");
+      await calibrateAllPlayers();
+      state.phase = "starting";
+      setStatus(`正在標記 ${state.players.length} 顆握力球編號…`, "waiting");
+      await identifyPlayers();
+      state.phase = "play";
+      state.readyStarted = performance.now();
+      emit({type: "player_count", count: state.players.length});
+      emit({type: "calibration_done"});
+      for (const player of state.players) {
+        emit({type: "track_player", player: player.playerId, value: Math.max(0, player.tracking)});
+      }
+      setStatus(`開始！握住追蹤鴨子，甩動才發射。`, "ready");
+    } catch (error) {
+      console.error(error);
+      state.phase = "connect";
+      setStatus(`校正失敗：${error.message || error}。請放開握力球後再開始。`, "error");
     }
-    setStatus(`開始！握住追蹤鴨子，甩動才發射。`, "ready");
     refreshUi();
   }
 

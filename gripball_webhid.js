@@ -72,13 +72,14 @@
     };
   }
 
-  function deviceKey(device) {
-    return device.serialNumber || `${device.vendorId}:${device.productId}:${device.productName}`;
-  }
-
   function playerForDevice(device) {
-    const key = deviceKey(device);
-    return state.players.find(player => deviceKey(player.device) === key);
+    return state.players.find((player) => {
+      if (player.device === device) return true;
+      if (device.serialNumber && player.device.serialNumber) {
+        return player.device.serialNumber === device.serialNumber;
+      }
+      return false;
+    });
   }
 
   function updatePlayerNumbers() {

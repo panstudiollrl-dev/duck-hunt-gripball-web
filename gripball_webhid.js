@@ -38,12 +38,15 @@
   const MAX_PLAYERS = 8;
 
   const TUNING_KEY = "gripball-tuning-v2";
+  const HUD_KEY = "gripball-hud-hidden";
   const TUNING_DEFAULTS = {
     engageForce: 60,
     releaseForce: 25,
     fullForce: 400,
     fireAccel: 26,
     cooldownMs: 1150,
+    hapticPower: 95,
+    hapticMs: 90,
   };
   const TUNING_FIELDS = [
     {key: "engageForce", label: "追蹤啟動", unit: "力", min: 5, max: 900, step: 5},
@@ -51,6 +54,8 @@
     {key: "fullForce", label: "追蹤全速", unit: "力", min: 40, max: 4000, step: 20},
     {key: "fireAccel", label: "甩動開槍", unit: "甩", min: 10, max: 90, step: 0.5},
     {key: "cooldownMs", label: "開槍冷卻", unit: "ms", min: 200, max: 2000, step: 50},
+    {key: "hapticPower", label: "震動強度", unit: "", min: 10, max: 100, step: 5},
+    {key: "hapticMs", label: "震動長度", unit: "", min: 10, max: 200, step: 5},
   ];
   let tuningTouched = false;
   const tuning = Object.assign({}, TUNING_DEFAULTS);
@@ -141,7 +146,7 @@
     if (!player) return;
     const data = new Uint8Array([3, 6, 0, 1, intensity, duration]);
     await command(player.device, 11, data);
-    player.hapticIgnoreUntil = performance.now() + 180;
+    player.hapticIgnoreUntil = performance.now() + Math.max(180, duration * 2 + 120);
   }
 
   function makePlayer(device, playerId) {
@@ -324,7 +329,7 @@
 
     player.lastShot = now;
     emit({type: "shoot_player", player: player.playerId});
-    haptic(player, 70, 35);
+    haptic(player, Math.round(tuning.hapticPower), Math.round(tuning.hapticMs));
     setStatus(`P${player.playerId + 1} fired`, "ready");
   }
 
@@ -754,14 +759,39 @@
     refreshTuningUi();
   }
 
+  function setHudHidden(hidden) {
+    const panel = document.getElementById("gripball-webhid");
+    const dot = document.getElementById("gripball-show");
+    if (panel) panel.style.display = hidden ? "none" : "flex";
+    if (dot) dot.style.display = hidden ? "block" : "none";
+    try {
+      window.localStorage.setItem(HUD_KEY, hidden ? "1" : "0");
+    } catch (error) {
+      console.warn("Could not save HUD state", error);
+    }
+  }
+
   function installUi() {
     const style = document.createElement("style");
-    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
+    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status{cursor:pointer}#gripball-show{position:fixed;z-index:99999;right:12px;top:12px;display:none;border:0;border-radius:7px;padding:5px 9px;background:#111a;color:#fff9;font:12px system-ui;cursor:pointer}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
     panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span>';
     document.body.appendChild(panel);
+    const dot = document.createElement("button");
+    dot.id = "gripball-show";
+    dot.textContent = "數值";
+    dot.title = "顯示即時數值";
+    document.body.appendChild(dot);
+    dot.addEventListener("click", () => setHudHidden(false));
+    document.getElementById("gripball-status").addEventListener("click", () => setHudHidden(true));
+    try {
+      setHudHidden(window.localStorage.getItem(HUD_KEY) === "1");
+    } catch (error) {
+      setHudHidden(false);
+    }
+
     document.getElementById("gripball-connect").addEventListener("click", addDevices);
     document.getElementById("gripball-start").addEventListener("click", startGame);
     installTuningUi();

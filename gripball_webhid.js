@@ -5,6 +5,8 @@
   const PRODUCT_ID = 0x0101;
   const REPORT_IMU = 3;
   const REPORT_GRIP = 5;
+  const CALIBRATION_ROUNDS = 3;
+  const CALIBRATION_HOLD_MS = 1500;
   const SHOT_COOLDOWN_MS = 800;
   const GYRO_FIRE_MIN = 260;
   const GYRO_FIRE_STRONG = 480;
@@ -22,6 +24,7 @@
     hapticIgnoreUntil: 0,
     readyStarted: 0,
     lastTrackEmit: 0,
+    calibrationStarted: 0,
   };
 
   function emit(message) {
@@ -57,7 +60,8 @@
       playerId,
       grip: null,
       baseline: null,
-      peakEstimate: null,
+      peak: null,
+      travel: 900,
       tracking: -1,
       accelReference: null,
       gyro: 0,
@@ -91,21 +95,15 @@
   function estimateGrip(player, grip) {
     player.grip = grip;
     if (player.baseline == null) {
-      player.baseline = grip;
-      player.peakEstimate = grip + 1200;
       return;
     }
     const force = grip - player.baseline;
-    const isHolding = force > 180;
-    if (!isHolding) {
+    const isHolding = force > Math.max(45, player.travel * 0.06);
+    if (state.phase === "play" && !isHolding) {
       player.baseline = player.baseline * 0.995 + grip * 0.005;
-    } else {
-      player.peakEstimate = Math.max(player.peakEstimate || grip, grip);
     }
-    player.peakEstimate = Math.max(player.peakEstimate || grip, player.baseline + 900);
-    const travel = Math.max((player.peakEstimate || player.baseline + 1200) - player.baseline, 700);
-    const rawStrength = Math.max(0, Math.min(1, force / travel));
-    const strength = force > 130 ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
+    const rawStrength = Math.max(0, Math.min(1, force / Math.max(player.travel, 120)));
+    const strength = force > Math.max(35, player.travel * 0.04) ? Math.max(0.16, Math.sqrt(rawStrength)) : 0;
     if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
       player.tracking = strength;
       emit({type: "track_player", player: player.playerId, value: strength});
@@ -223,11 +221,9 @@
     }
     try {
       await resumeAudioAndFocusCanvas();
-      await navigator.hid.requestDevice({filters: [{vendorId: VENDOR_ID, productId: PRODUCT_ID}]});
-      const granted = await navigator.hid.getDevices();
-      const gripballs = granted
-        .filter(device => device.vendorId === VENDOR_ID && device.productId === PRODUCT_ID)
-        .slice(0, MAX_PLAYERS);
+      const gripballs = (await navigator.hid.requestDevice({
+        filters: [{vendorId: VENDOR_ID, productId: PRODUCT_ID}],
+      })).slice(0, MAX_PLAYERS);
       for (const device of gripballs) {
         if (playerForDevice(device)) continue;
         if (!device.opened) await device.open();
@@ -259,11 +255,111 @@
     }
   }
 
+  function median(values) {
+    const sorted = values.slice().sort((a, b) => a - b);
+    return sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+  }
+
+  function emitCalibration(player, text, progress, peak) {
+    emit({
+      type: "calibration",
+      step: `P${player.playerId + 1} / ${state.players.length}`,
+      text,
+      progress,
+      raw: player.grip == null ? "--" : Math.round(player.grip),
+      baseline: player.baseline == null ? "--" : Math.round(player.baseline),
+      force: player.grip == null || player.baseline == null ? "--" : Math.max(0, Math.round(player.grip - player.baseline)),
+      peak: peak == null ? "--" : Math.round(peak),
+    });
+    setStatus(
+      `P${player.playerId + 1}: ${text} ` +
+      `(raw ${player.grip == null ? "--" : Math.round(player.grip)})`,
+      "waiting"
+    );
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function waitForGrip(player, timeoutMs = 3000) {
+    const start = performance.now();
+    while (player.grip == null && performance.now() - start < timeoutMs) {
+      await sleep(20);
+    }
+    return player.grip != null;
+  }
+
+  async function calibratePlayer(player) {
+    await haptic(player, 45, 40);
+    await waitForGrip(player);
+    const baselineSamples = [];
+    const baselineStart = performance.now();
+    while (performance.now() - baselineStart < 1000) {
+      if (player.grip != null) baselineSamples.push(player.grip);
+      emitCalibration(player, "RELAX", Math.min((performance.now() - baselineStart) / 1000 * 100, 100));
+      await sleep(80);
+    }
+    player.baseline = median(baselineSamples) || player.grip || 0;
+
+    const peaks = [];
+    for (let round = 1; round <= CALIBRATION_ROUNDS; round += 1) {
+      await haptic(player, 60, 45);
+      let holdStart = 0;
+      let peak = player.baseline;
+      let lastUi = 0;
+      while (true) {
+        const now = performance.now();
+        const force = player.grip == null ? 0 : player.grip - player.baseline;
+        peak = Math.max(peak, player.grip || peak);
+        if (force > 55) {
+          if (!holdStart) holdStart = now;
+        } else if (force < 30) {
+          holdStart = 0;
+        }
+        const heldMs = holdStart ? now - holdStart : 0;
+        if (now - lastUi > 90) {
+          emitCalibration(
+            player,
+            `PRESS ${round}/${CALIBRATION_ROUNDS} ${Math.min(heldMs / 1000, 1.5).toFixed(1)}/1.5s`,
+            ((round - 1) + Math.min(heldMs / CALIBRATION_HOLD_MS, 1)) / CALIBRATION_ROUNDS * 100,
+            peak
+          );
+          lastUi = now;
+        }
+        if (heldMs >= CALIBRATION_HOLD_MS) break;
+        await sleep(20);
+      }
+      peaks.push(peak);
+      emitCalibration(player, `RELEASE ${round}/${CALIBRATION_ROUNDS}`, round / CALIBRATION_ROUNDS * 100, peak);
+      await haptic(player, 35, 25);
+      const releaseStart = performance.now();
+      while (performance.now() - releaseStart < 500) await sleep(20);
+    }
+
+    player.peak = median(peaks);
+    player.travel = Math.max(player.peak - player.baseline, 120);
+    player.tracking = -1;
+    emitCalibration(player, "DONE", 100, player.peak);
+    await haptic(player, 70, 60);
+    await sleep(300);
+  }
+
+  async function calibrateAllPlayers() {
+    state.phase = "calibrating";
+    refreshUi();
+    state.calibrationStarted = performance.now();
+    for (const player of state.players) {
+      await calibratePlayer(player);
+    }
+  }
+
   async function startGame() {
     if (state.players.length < 1 || state.phase !== "connect") return;
     await resumeAudioAndFocusCanvas();
+    setStatus(`準備校正 ${state.players.length} 顆握力球…`, "waiting");
+    await calibrateAllPlayers();
     state.phase = "starting";
-    refreshUi();
     setStatus(`正在標記 ${state.players.length} 顆握力球編號…`, "waiting");
     await identifyPlayers();
     state.phase = "play";

@@ -22,6 +22,14 @@
   const TRACK_ENGAGE_RATIO = 0.14;
   const TRACK_RELEASE_RATIO = 0.07;
   const GRIP_STALE_MS = 250;
+  const SETTLE_MS = 2200;
+  const AUTOZERO_WINDOW_MS = 6000;
+  const WAKE_TIMEOUT_MS = 25000;
+  const WAKE_STREAM_MS = 500;
+  const REST_FLAT_MS = 600;
+  const REST_FLAT_SAMPLES = 30;
+  const REST_FLAT_TOLERANCE = 24;
+  const REST_TIMEOUT_MS = 20000;
 
   const SHAKE_REST_MS = 900;
   const SHAKE_SAMPLE_MS = 2500;
@@ -38,6 +46,7 @@
     readyStarted: 0,
     lastTrackEmit: 0,
     calibrationStarted: 0,
+    lastDebugAt: 0,
   };
 
   function emit(message) {
@@ -77,6 +86,8 @@
       travel: 900,
       tracking: -1,
       holding: false,
+      holdSince: 0,
+      gripLog: [],
       gripNoise: 0,
       lastGripAt: 0,
       accel: null,
@@ -87,18 +98,13 @@
       armed: false,
       stableSince: 0,
       hapticIgnoreUntil: 0,
+      onInput: null,
       lastShot: 0,
     };
   }
 
   function playerForDevice(device) {
-    return state.players.find((player) => {
-      if (player.device === device) return true;
-      if (device.serialNumber && player.device.serialNumber) {
-        return player.device.serialNumber === device.serialNumber;
-      }
-      return false;
-    });
+    return state.players.find((player) => player.device === device);
   }
 
   function updatePlayerNumbers() {
@@ -111,13 +117,27 @@
     return device && device.vendorId === VENDOR_ID && device.productId === PRODUCT_ID;
   }
 
+  const enrolling = new Set();
+
   async function enrollDevice(device, vibrate = true) {
-    if (!isGripball(device) || playerForDevice(device) || state.players.length >= MAX_PLAYERS) {
+    if (!isGripball(device) || playerForDevice(device) || enrolling.has(device)) {
       return false;
     }
+    if (state.players.length >= MAX_PLAYERS) return false;
+    enrolling.add(device);
+    try {
+      return await enrollDeviceInner(device, vibrate);
+    } finally {
+      enrolling.delete(device);
+    }
+  }
+
+  async function enrollDeviceInner(device, vibrate) {
     if (!device.opened) await device.open();
+    if (playerForDevice(device)) return false;
     const player = makePlayer(device, state.players.length);
-    device.addEventListener("inputreport", event => parseInput(player, event));
+    player.onInput = (event) => parseInput(player, event);
+    device.addEventListener("inputreport", player.onInput);
     state.players.push(player);
     await stream(player);
     if (vibrate) await haptic(player, 55, 45);
@@ -146,13 +166,45 @@
     const force = grip - player.baseline;
     const engageForce = Math.max(TRACK_ENGAGE_MIN, player.travel * TRACK_ENGAGE_RATIO);
     const releaseForce = Math.max(TRACK_RELEASE_MIN, player.travel * TRACK_RELEASE_RATIO);
+    const now = performance.now();
     if (player.holding) {
-      if (force < releaseForce) player.holding = false;
+      if (force < releaseForce) {
+        player.holding = false;
+        player.holdSince = 0;
+      }
     } else if (force >= engageForce) {
       player.holding = true;
+      player.holdSince = now;
     }
-    if (state.phase === "play" && !player.holding && force < releaseForce) {
-      player.baseline = player.baseline * 0.997 + grip * 0.003;
+
+    player.gripLog.push(now, grip);
+    while (player.gripLog.length > 2 && now - player.gripLog[0] > AUTOZERO_WINDOW_MS) {
+      player.gripLog.splice(0, 2);
+    }
+    if (
+      state.phase === "play" &&
+      player.holding &&
+      player.holdSince &&
+      now - player.holdSince > AUTOZERO_WINDOW_MS &&
+      player.gripLog.length >= 80
+    ) {
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = 1; i < player.gripLog.length; i += 2) {
+        const value = player.gripLog[i];
+        if (value < lo) lo = value;
+        if (value > hi) hi = value;
+      }
+      if (hi - lo < releaseForce && lo > player.baseline + releaseForce) {
+        player.baseline = lo;
+        player.holding = false;
+        player.holdSince = 0;
+        player.gripLog.length = 0;
+      }
+    }
+
+    if (state.phase === "play" && !player.holding) {
+      player.baseline = player.baseline * 0.995 + grip * 0.005;
     }
     const rawStrength = Math.max(0, Math.min(1, force / Math.max(player.travel, 80)));
     const strength = player.holding ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
@@ -322,75 +374,73 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async function waitForGrip(player, timeoutMs = 3000) {
-    const start = performance.now();
-    while (player.grip == null && performance.now() - start < timeoutMs) {
-      await sleep(20);
-    }
-    return player.grip != null;
+  function gripIsLive(player) {
+    return player.grip != null && performance.now() - player.lastGripAt < GRIP_STALE_MS;
   }
 
-  async function collectReleasedBaseline(player, text, progress) {
-    const samples = [];
+  async function waitForStream(player, label) {
     const start = performance.now();
-    let lastUi = 0;
-    while (performance.now() - start < CALIBRATION_SAMPLE_MS) {
-      if (player.grip != null) samples.push(player.grip);
-      if (performance.now() - lastUi > 90) {
-        const tempBaseline = samples.length ? median(samples) : player.baseline;
-        if (tempBaseline != null) player.baseline = tempBaseline;
-        emitCalibration(player, text, progress);
-        lastUi = performance.now();
-      }
-      await sleep(30);
-    }
-    if (samples.length) {
-      player.baseline = median(samples);
-      player.gripNoise = medianAbsoluteDeviation(samples, player.baseline);
-    } else {
-      player.gripNoise = 0;
-    }
-  }
-
-  async function waitForReleased(player, round, progress) {
-    const samples = [];
-    const started = performance.now();
-    let releaseStart = 0;
+    let liveSince = 0;
     let lastUi = 0;
     while (true) {
       const now = performance.now();
-      if (now - started > CALIBRATION_STEP_TIMEOUT_MS) {
-        throw new Error(
-          `P${player.playerId + 1} 偵測不到放開（raw ${Math.round(player.grip)} / base ${Math.round(player.baseline)}）`
-        );
+      if (now - start > WAKE_TIMEOUT_MS) {
+        throw new Error(`P${player.playerId + 1} 收不到壓力資料，請按一下球喚醒它`);
       }
-      if (player.grip != null) {
-        samples.push(player.grip);
-        while (samples.length > 35) samples.shift();
-        const candidateBaseline = median(samples);
-        const noise = medianAbsoluteDeviation(samples, candidateBaseline);
-        const stableWindow = Math.max(...samples) - Math.min(...samples);
-        if (samples.length >= 12 && stableWindow < Math.max(45, noise * 8 + 18)) {
-          if (player.baseline == null || candidateBaseline < player.baseline + CALIBRATION_BASELINE_CREEP) {
-            player.baseline = candidateBaseline;
-          }
-          player.gripNoise = noise;
-        }
-      }
-      const force = player.grip == null || player.baseline == null ? 999 : Math.abs(player.grip - player.baseline);
-      const releaseThreshold = Math.max(28, (player.gripNoise || 0) * 5 + 12);
-      if (force <= releaseThreshold) {
-        if (!releaseStart) releaseStart = now;
+      if (gripIsLive(player)) {
+        if (!liveSince) liveSince = now;
+        if (now - liveSince >= WAKE_STREAM_MS) break;
       } else {
-        releaseStart = 0;
+        liveSince = 0;
       }
       if (now - lastUi > 90) {
-        emitCalibration(player, `RELEASE BEFORE ${round}/${CALIBRATION_ROUNDS}`, progress);
+        emitCalibration(player, label, 0);
         lastUi = now;
       }
-      if (releaseStart && now - releaseStart >= CALIBRATION_RELEASE_MS) break;
       await sleep(25);
     }
+  }
+
+  async function captureRestBaseline(player, label, progress) {
+    const samples = [];
+    const start = performance.now();
+    let flatSince = 0;
+    let lastUi = 0;
+    while (true) {
+      const now = performance.now();
+      if (now - start > REST_TIMEOUT_MS) {
+        throw new Error(
+          `P${player.playerId + 1} 靜置讀數抓不穩（raw ${player.grip == null ? "--" : Math.round(player.grip)}）`
+        );
+      }
+      if (gripIsLive(player)) {
+        samples.push(player.grip);
+        while (samples.length > REST_FLAT_SAMPLES) samples.shift();
+        if (samples.length >= REST_FLAT_SAMPLES) {
+          const lo = Math.min(...samples);
+          const hi = Math.max(...samples);
+          if (hi - lo <= REST_FLAT_TOLERANCE) {
+            if (!flatSince) flatSince = now;
+          } else {
+            flatSince = 0;
+          }
+        }
+      } else {
+        flatSince = 0;
+        samples.length = 0;
+      }
+      if (flatSince && now - flatSince >= REST_FLAT_MS) break;
+      if (now - lastUi > 90) {
+        emitCalibration(player, label, progress || 0);
+        lastUi = now;
+      }
+      await sleep(25);
+    }
+    player.baseline = median(samples);
+    player.gripNoise = medianAbsoluteDeviation(samples, player.baseline);
+    player.holding = false;
+    player.holdSince = 0;
+    player.gripLog.length = 0;
   }
 
   async function calibrateShake(player) {
@@ -453,18 +503,29 @@
     await sleep(250);
   }
 
+  async function settleAllPlayers() {
+    await Promise.all(
+      state.players.map((player) => waitForStream(player, "PRESS EACH BALL ONCE"))
+    );
+    await Promise.all(
+      state.players.map((player) =>
+        captureRestBaseline(player, "ALL PLAYERS HOLD BALL - DO NOT PRESS", 100)
+      )
+    );
+    for (const player of state.players) {
+      player.tracking = -1;
+    }
+  }
+
   async function calibratePlayer(player) {
     await haptic(player, 45, 40);
-    const hasGrip = await waitForGrip(player);
-    if (!hasGrip) {
-      throw new Error(`P${player.playerId + 1} has no grip data`);
-    }
-    await collectReleasedBaseline(player, "HOLD BALL - DO NOT PRESS", 0);
+    await waitForStream(player, "PRESS BALL ONCE TO WAKE");
+    await captureRestBaseline(player, "HOLD BALL - DO NOT PRESS", 0);
 
     const peaks = [];
     for (let round = 1; round <= CALIBRATION_ROUNDS; round += 1) {
       const baseProgress = (round - 1) / CALIBRATION_ROUNDS * 100;
-      await waitForReleased(player, round, baseProgress);
+      await captureRestBaseline(player, `RELEASE BEFORE ${round}/${CALIBRATION_ROUNDS}`, baseProgress);
       await haptic(player, 60, 45);
       let holdStart = 0;
       let peak = player.grip || player.baseline;
@@ -484,7 +545,7 @@
             `P${player.playerId + 1} 按壓不足（需 ${Math.round(pressThreshold)}，最高 ${Math.round(peakForce)}）`
           );
         }
-        const force = player.grip == null ? 0 : player.grip - player.baseline;
+        const force = gripIsLive(player) ? player.grip - player.baseline : 0;
         peak = Math.max(peak, player.grip || peak);
         peakForce = Math.max(peakForce, force);
         if (force >= pressThreshold) {
@@ -534,6 +595,7 @@
     for (const player of state.players) {
       await calibratePlayer(player);
     }
+    await settleAllPlayers();
   }
 
   async function startGame() {
@@ -579,6 +641,14 @@
     navigator.hid.addEventListener("disconnect", (event) => {
       const player = playerForDevice(event.device);
       if (!player) return;
+      if (player.onInput) {
+        try {
+          player.device.removeEventListener("inputreport", player.onInput);
+        } catch (error) {
+          console.warn("Could not detach Gripball listener", error);
+        }
+        player.onInput = null;
+      }
       state.players = state.players.filter((item) => item !== player);
       updatePlayerNumbers();
       emit({type: "player_count", count: state.players.length});
@@ -607,6 +677,22 @@
         if (now - state.readyStarted < 4000) {
           emit({type: "player_count", count: state.players.length});
           emit({type: "calibration_done"});
+        }
+        if (now - state.lastDebugAt > 200) {
+          state.lastDebugAt = now;
+          setStatus(
+            state.players.map((player) => {
+              const force = player.grip == null || player.baseline == null
+                ? 0 : Math.round(player.grip - player.baseline);
+              const engage = Math.round(Math.max(TRACK_ENGAGE_MIN, player.travel * TRACK_ENGAGE_RATIO));
+              const accel = player.accel == null ? 0 : player.accel;
+              const fire = player.fireThreshold == null ? 0 : player.fireThreshold;
+              const raw = player.grip == null ? "--" : Math.round(player.grip);
+              return `P${player.playerId + 1} ${player.holding ? "握" : "放"} raw${raw}` +
+                ` 力${force}/${engage} 甩${accel.toFixed(2)}/${fire.toFixed(2)}`;
+            }).join("   "),
+            "ready"
+          );
         }
       }
       return JSON.stringify(queue.splice(0, queue.length));

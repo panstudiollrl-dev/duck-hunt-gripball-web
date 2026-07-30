@@ -12,6 +12,20 @@ const PARTY_TRACK_SPEED_MIN := 55.0
 const PARTY_TRACK_SPEED_MAX := 255.0
 const PARTY_WOBBLE_MIN := 10.0
 const PARTY_WOBBLE_MAX := 42.0
+# The aim-tracking tone is a continuous pitch bend, so it needs updates far more often than
+# the 0.22s proximity feedback - at that rate the pitch would move in audible steps. 30Hz is
+# frequent enough to sound continuous once the JS side smooths between updates, without
+# calling into JavaScriptBridge every single frame.
+const TRACK_TONE_INTERVAL := 1.0 / 30.0
+# Closeness is measured against a fraction of the screen diagonal, matching the existing
+# proximity calculation so the audio and the (disabled) haptics agree on what "close" means.
+const TRACK_TONE_RANGE := 0.65
+# Party Mode's targets arrive as bare positions (_get_gripball_player_target returns a
+# Vector2), so there is no hitbox to test against the way single player does. This radius
+# stands in for one: it is a little wider than the duck's own collision circle, which suits
+# Party Mode anyway - the crosshair there wobbles on purpose, so an exact-to-the-pixel lock
+# would flicker the tone on and off as the wobble crosses the edge.
+const TRACK_LOCK_RADIUS := 22.0
 var udp := PacketPeerUDP.new()
 var feedback_udp := PacketPeerUDP.new()
 var virtual_position := Vector2.ZERO
@@ -33,6 +47,8 @@ var progress_bar: ProgressBar
 var calibration_panel: ColorRect
 var value_label: Label
 var last_feedback_time := 0.0
+var last_track_tone_time := 0.0
+var track_tone_active := false
 var web_mode := false
 
 
@@ -290,36 +306,51 @@ func _update_tracking(delta: float) -> void:
 		_update_party_tracking(delta)
 		return
 	if tracking_strength <= 0.01:
+		_send_track_tones([])
 		return
 	var duck := get_tree().current_scene.find_child("Duck", true, false)
-	if duck and duck.get("input_pickable"):
-		var target: Vector2 = duck.global_position
-		var speed := lerpf(TRACK_SPEED_MIN, TRACK_SPEED_MAX, tracking_strength)
-		virtual_position = virtual_position.move_toward(target, speed * delta)
-		crosshair.position = virtual_position
-		var now := Time.get_ticks_msec() / 1000.0
-		if now - last_feedback_time >= 0.22:
-			var diagonal := get_viewport().get_visible_rect().size.length()
-			var distance := virtual_position.distance_to(target)
-			var closeness := 1.0 - clampf(distance / (diagonal * 0.65), 0.0, 1.0)
-			var intensity := roundi(20.0 + closeness * 75.0)
-			if web_mode:
-				JavaScriptBridge.eval(
-					"window.gripballBridge && window.gripballBridge.proximity(%d)" % intensity,
-					true
-				)
-			else:
-				feedback_udp.put_packet(
-					JSON.stringify({"type": "proximity", "intensity": intensity}).to_utf8_buffer()
-				)
-			last_feedback_time = now
+	if not duck or not duck.get("input_pickable"):
+		# No duck to aim at, so there is nothing for the tone to report.
+		_send_track_tones([])
+		return
+	var target: Vector2 = duck.global_position
+	var speed := lerpf(TRACK_SPEED_MIN, TRACK_SPEED_MAX, tracking_strength)
+	virtual_position = virtual_position.move_toward(target, speed * delta)
+	crosshair.position = virtual_position
+	var closeness := _closeness_to(virtual_position, target)
+	_send_track_tones([{
+		"id": 0,
+		"x": virtual_position.x,
+		"y": virtual_position.y,
+		"closeness": closeness,
+		# Uses the duck's real hitbox, the same test _try_hit_duck() does, so the tone going
+		# silent means exactly "a shot right now would land" rather than "quite close".
+		"locked": _is_on_duck(virtual_position, duck),
+	}])
+	var now := Time.get_ticks_msec() / 1000.0
+	if now - last_feedback_time >= 0.22:
+		var intensity := roundi(20.0 + closeness * 75.0)
+		if web_mode:
+			JavaScriptBridge.eval(
+				"window.gripballBridge && window.gripballBridge.proximity(%d)" % intensity,
+				true
+			)
+		else:
+			feedback_udp.put_packet(
+				JSON.stringify({"type": "proximity", "intensity": intensity}).to_utf8_buffer()
+			)
+		last_feedback_time = now
 
 
 func _update_party_tracking(delta: float) -> void:
 	if party_crosshairs.is_empty():
+		_send_track_tones([])
 		return
 	var scene := get_tree().current_scene
 	var viewport_size := get_viewport().get_visible_rect().size
+	# One entry per player who is actively tracking. Collected across the whole loop and sent
+	# once, so the JS side can share gain between however many voices are sounding.
+	var tones: Array = []
 	for player_id in party_crosshairs.keys():
 		var sprite: Sprite2D = party_crosshairs[player_id]
 		var strength := float(party_strengths.get(player_id, 0.0))
@@ -353,6 +384,64 @@ func _update_party_tracking(delta: float) -> void:
 		current = current.clamp(Vector2.ZERO, viewport_size)
 		party_positions[player_id] = current
 		sprite.position = current
+		# Closeness to the real target, not to the wobbled chase point: the tone should report
+		# how well aimed the player is, not the deliberate unsteadiness added to the crosshair.
+		tones.append({
+			"id": player_id,
+			"x": current.x,
+			"y": current.y,
+			"closeness": _closeness_to(current, target),
+			"locked": current.distance_to(target) <= TRACK_LOCK_RADIUS,
+		})
+	_send_track_tones(tones)
+
+
+func _is_on_duck(point: Vector2, duck: Node) -> bool:
+	# Same geometry as _try_hit_duck(), so "the tone went silent" and "the shot would have
+	# hit" can never disagree. Anything unexpected about the node counts as not-locked: a
+	# tone that stays audible is a far smaller problem than one that goes silent on a miss.
+	if not duck or not duck.get("input_pickable"):
+		return false
+	var collision := duck.get_node_or_null("CollisionShape2D") as CollisionShape2D
+	if not collision or not collision.shape:
+		return false
+	return collision.shape.get_rect().has_point(collision.to_local(point))
+
+
+func _closeness_to(from: Vector2, target: Vector2) -> float:
+	# 1.0 when the crosshair is on the duck, falling to 0.0 once it is TRACK_TONE_RANGE of a
+	# screen diagonal away. This is the pitch control: near duck -> high pitch.
+	var diagonal := get_viewport().get_visible_rect().size.length()
+	if diagonal <= 0.0:
+		return 0.0
+	var distance := from.distance_to(target)
+	return 1.0 - clampf(distance / (diagonal * TRACK_TONE_RANGE), 0.0, 1.0)
+
+
+func _send_track_tones(entries: Array) -> void:
+	# Sends every currently-tracking crosshair at once. The JS side fades out any voice whose
+	# id is absent from the list, so an empty array is also how tracking is stopped - there is
+	# no separate stop call to keep in sync.
+	if not web_mode:
+		return
+	var now := Time.get_ticks_msec() / 1000.0
+	if entries.is_empty():
+		if not track_tone_active:
+			return
+		track_tone_active = false
+	else:
+		if now - last_track_tone_time < TRACK_TONE_INTERVAL:
+			return
+		track_tone_active = true
+	last_track_tone_time = now
+	# Viewport size travels with the payload for the same reason as the duck sounds: x/y are
+	# viewport coordinates, and window.innerWidth is a different space once letterboxed.
+	var viewport_size := get_viewport().get_visible_rect().size
+	var expression := (
+		"window.duckHuntSpatialAudio && window.duckHuntSpatialAudio.syncTracking " +
+		"? window.duckHuntSpatialAudio.syncTracking(%s, %f, %f) : false"
+	) % [JSON.stringify(JSON.stringify(entries)), viewport_size.x, viewport_size.y]
+	JavaScriptBridge.eval(expression, true)
 
 
 func _send_click(pressed: bool) -> void:

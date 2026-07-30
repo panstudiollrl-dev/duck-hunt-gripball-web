@@ -1490,9 +1490,10 @@
     // ---------------------------------------------------------------------------------
     // Aim-tracking tone
     //
-    // A sustained synth voice per crosshair while the player is tracking a duck: pitch
-    // rises as the crosshair closes on the duck (the "getting warmer" cue), and the voice
-    // is spatialized at the crosshair's own position on screen.
+    // A sustained FM voice per crosshair while the player is tracking a duck: pitch rises
+    // as the crosshair closes on the duck (the "getting warmer" cue), the voice is
+    // spatialized at the crosshair's own position on screen, and it falls silent at
+    // lock-on so that aiming resolves into silence instead of into a held high note.
     //
     // Unlike the one-shot duck sounds, this voice keeps sounding while it moves, so
     // switching IRs under it would click. This is the case that needs the A/B convolver
@@ -1504,36 +1505,81 @@
     const TONE_PEAK_GAIN = 0.16;      // deliberately well under the game's own sounds
     const TONE_FADE_MS = 90;          // in/out, and the IR handover
     const TONE_GLIDE_MS = 70;         // pitch/volume smoothing between updates
+    // The tone drops out once the crosshair is on the duck. Aiming is then a movement
+    // *into silence*, which makes the moment of alignment land as an event rather than as
+    // "the pitch got a bit higher" - the spatial sweep reads as one brief gesture. The
+    // voice itself stays alive and silent, so drifting off brings it straight back.
+    //
+    // Godot tells us when the crosshair is actually on the duck (`locked`), because only it
+    // knows the hitbox. The fade has to *finish* by the time the hitbox is reached, or the
+    // tone would still be at full volume the instant it cuts to silence. The game viewport
+    // is 256x240 (NES), so the hitbox is a big fraction of the screen: at a ~22px lock
+    // radius the fade has to start around 70px out, which is closeness ~0.69. Earlier
+    // values here (0.88/0.98) put the whole fade *inside* the hitbox, so in practice the
+    // tone jumped straight from full volume to silent and then stayed silent for most of
+    // the hold - which is the "can't hear it at all" symptom.
+    const TONE_LOCK_START = 0.82;     // starts ducking out here (~41px from the duck)
+    const TONE_LOCK_SILENT = 0.90;    // fully silent by here (~23px), i.e. at the hitbox
+    const TONE_LOCK_MS = 55;          // fast enough to feel like an event, not a click
+    // FM timbres, one per player. Each is a (harmonicity ratio, modulation index) pair -
+    // the two numbers that decide an FM voice's character. Party Mode players need to tell
+    // their own tone apart from everyone else's while all of them sweep the same pitch
+    // range, and timbre separates far better than the detune it replaces: whole different
+    // harmonic series rather than the same sound slightly out of tune.
+    const TONE_TIMBRES = [
+      {ratio: 1, index: 1.6, carrier: "sine"},       // P1: soft, nearly pure, flute-ish
+      {ratio: 2, index: 3.2, carrier: "sine"},       // P2: nasal and reedy, clearly brighter
+      {ratio: 3.5, index: 2.4, carrier: "sine"},     // P3: inharmonic ratio -> bell/metallic
+      {ratio: 0.5, index: 4, carrier: "triangle"},   // P4: hollow, buzzy, sits underneath
+    ];
     const voices = new Map();
+
+    function timbreFor(id) {
+      const count = TONE_TIMBRES.length;
+      const index = ((Math.trunc(id) % count) + count) % count;
+      return TONE_TIMBRES[index];
+    }
+
+    // 1.0 well away from the duck, 0.0 once it is aimed at. Smoothstep rather than a step,
+    // so the drop-out has no corner in it to click on. `locked` (the game's own hit test)
+    // forces silence regardless of closeness: the duck's hitbox is bigger than the couple of
+    // pixels TONE_LOCK_SILENT works out to, so without it the tone would still be sounding
+    // at positions where a shot already hits.
+    function lockEnvelope(closeness, locked) {
+      if (locked) return 0;
+      if (closeness <= TONE_LOCK_START) return 1;
+      if (closeness >= TONE_LOCK_SILENT) return 0;
+      const t = (closeness - TONE_LOCK_START) / (TONE_LOCK_SILENT - TONE_LOCK_START);
+      return 1 - t * t * (3 - 2 * t);
+    }
 
     function makeTrackingVoice(id) {
       const context = getContext();
-      // Two oscillators a hair apart beat gently against each other, which makes the
-      // pitch movement much easier to hear than a bare sine.
-      const oscA = context.createOscillator();
-      const oscB = context.createOscillator();
-      oscA.type = "triangle";
-      oscB.type = "sine";
-      // Each player gets a slightly different detune so several tracking tones at once
-      // stay tellable apart in Party Mode.
-      const detune = 4 + (id % 4) * 3;
-      oscB.detune.value = detune;
+      // FM: one modulator bending the carrier's frequency. The modulator's own frequency
+      // and depth are both kept proportional to the carrier below, which is what holds the
+      // timbre steady while the pitch sweeps - a fixed depth in Hz would make the voice
+      // change character as it rises.
+      const timbre = timbreFor(id);
+      const carrier = context.createOscillator();
+      const mod = context.createOscillator();
+      carrier.type = timbre.carrier;
+      mod.type = "sine";
+      const modDepth = context.createGain();
+      modDepth.gain.value = 0;
+      mod.connect(modDepth);
+      modDepth.connect(carrier.frequency);
 
-      const mix = context.createGain();
-      mix.gain.value = 0.5;
       const tone = context.createGain();
       tone.gain.value = 0;        // silent until the first update fades it in
       const airFilter = context.createBiquadFilter();
       airFilter.type = "lowpass";
       airFilter.frequency.value = 16000;
 
-      oscA.connect(mix);
-      oscB.connect(mix);
-      mix.connect(tone);
+      carrier.connect(tone);
       tone.connect(airFilter);
 
       const voice = {
-        id, context, oscA, oscB, tone, airFilter,
+        id, context, timbre, carrier, mod, modDepth, tone, airFilter,
         started: false, stopping: false,
         irName: null, activeConv: "A", convA: null, convB: null, gainA: null, gainB: null,
         panner: null,
@@ -1618,25 +1664,44 @@
       voice.irName = wanted;
     }
 
-    function updateVoice(voice, closeness, vector) {
+    // In Party Mode every player has their own crosshair, so several tracking voices sound
+    // at once. Summing them at full level would be both loud and muddy, so share headroom
+    // between them. Scaled by 1/sqrt(n) rather than 1/n: equal-power summing keeps the
+    // perceived loudness roughly constant without making each individual voice vanish as
+    // players join.
+    function shareOfGain(count) {
+      return 1 / Math.sqrt(Math.max(1, count));
+    }
+
+    function updateVoice(voice, closeness, vector, share, locked) {
       const context = voice.context;
       const now = context.currentTime;
       const glide = TONE_GLIDE_MS / 1000;
       if (!voice.started) {
-        voice.oscA.start();
-        voice.oscB.start();
+        voice.carrier.start();
+        voice.mod.start();
         voice.started = true;
       }
       // Pitch in semitones rather than Hz, so the rise sounds evenly paced rather than
       // bunched up at the bottom.
       const octaves = Math.log2(TONE_MAX_HZ / TONE_MIN_HZ);
       const hz = TONE_MIN_HZ * Math.pow(2, octaves * Math.max(0, Math.min(1, closeness)));
-      voice.oscA.frequency.setTargetAtTime(hz, now, glide);
-      voice.oscB.frequency.setTargetAtTime(hz, now, glide);
+      voice.carrier.frequency.setTargetAtTime(hz, now, glide);
+      // Modulator tracks the carrier so the timbre stays put as the pitch sweeps, and the
+      // depth is index * modulator frequency (the standard FM definition of index).
+      const modHz = hz * voice.timbre.ratio;
+      voice.mod.frequency.setTargetAtTime(modHz, now, glide);
+      voice.modDepth.gain.setTargetAtTime(modHz * voice.timbre.index, now, glide);
       // Swell a little as it closes in, so the cue reads even at a glance-level of
-      // attention, but never loud enough to fight the quacks.
-      const level = TONE_PEAK_GAIN * (0.55 + 0.45 * closeness);
-      voice.tone.gain.setTargetAtTime(level, now, glide);
+      // attention, but never loud enough to fight the quacks - then duck out entirely at
+      // lock-on. The lock-out uses its own short time constant: the swell wants to be
+      // smooth, but the disappearance wants to be noticeable.
+      const lock = lockEnvelope(closeness, locked);
+      const level =
+        TONE_PEAK_GAIN * (0.55 + 0.45 * closeness) * (share == null ? 1 : share) * lock;
+      voice.tone.gain.setTargetAtTime(
+        level, now, lock < 1 ? TONE_LOCK_MS / 1000 : glide
+      );
       const depth = Math.min(1, vector.dist);
       voice.airFilter.frequency.setTargetAtTime(
         Math.max(1200, 16000 - depth * 11000), now, glide
@@ -1654,8 +1719,8 @@
       voice.tone.gain.setValueAtTime(voice.tone.gain.value, now);
       voice.tone.gain.linearRampToValueAtTime(0, now + fade);
       if (voice.started) {
-        voice.oscA.stop(now + fade + 0.02);
-        voice.oscB.stop(now + fade + 0.02);
+        voice.carrier.stop(now + fade + 0.02);
+        voice.mod.stop(now + fade + 0.02);
       }
     }
 
@@ -1667,6 +1732,15 @@
         const active = typeof payload === "string" ? JSON.parse(payload) : payload;
         if (!Array.isArray(active)) return false;
         getContext();
+        // Locked voices are silent, so they should not take a share of the headroom - with
+        // one player locked on, the others would otherwise duck for no audible reason.
+        let audible = 0;
+        for (const entry of active) {
+          if (!entry) continue;
+          const near = Math.max(0, Math.min(1, Number(entry.closeness) || 0));
+          if (lockEnvelope(near, Boolean(entry.locked)) > 0) audible += 1;
+        }
+        const share = shareOfGain(audible);
         const seen = new Set();
         for (const entry of active) {
           if (!entry) continue;
@@ -1679,7 +1753,7 @@
             voices.set(id, voice);
           }
           const vector = sourceVector(Number(entry.x) || 0, Number(entry.y) || 0, vw, vh);
-          updateVoice(voice, closeness, vector);
+          updateVoice(voice, closeness, vector, share, Boolean(entry.locked));
         }
         for (const [id, voice] of voices) {
           if (seen.has(id)) continue;
@@ -1717,7 +1791,21 @@
       await Promise.all([...wanted].map(loadHrirBuffer));
     }
 
-    window.duckHuntSpatialAudio = {play};
+    // debugVoice() is read-only and exists for tone_bench.html, which needs to display the
+    // gain/pitch actually reaching the graph rather than recomputing them and possibly
+    // agreeing with itself about a bug.
+    function debugVoice(id) {
+      const voice = voices.get(Number(id) || 0);
+      if (!voice) return null;
+      return {
+        hz: voice.carrier.frequency.value,
+        gain: voice.tone.gain.value,
+        irName: voice.irName,
+        spatializer: voice.panner ? "panner" : "convolver",
+      };
+    }
+
+    window.duckHuntSpatialAudio = {play, syncTracking, stopAllTracking, debugVoice};
 
     // Needs a live AudioContext to decode into, so it can only run after a user gesture.
     // Kick it off on the first interaction and let it finish in the background.

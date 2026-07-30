@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<title>準心追蹤音測試台</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.6 system-ui;padding:18px}
+  h1{font-size:17px;margin:0 0 4px}
+  p.sub{margin:0 0 16px;color:#8b949e;font-size:13px}
+  #stage{position:relative;width:512px;height:480px;background:#132030;border:1px solid #30363d;
+         border-radius:8px;cursor:crosshair;overflow:hidden}
+  #duck{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;
+        background:#f59b23;opacity:.30;pointer-events:none}
+  #duck.locked{opacity:.75;background:#3fb950}
+  #hair{position:absolute;width:18px;height:18px;margin:-9px 0 0 -9px;pointer-events:none;
+        border:2px solid #65c7ff;border-radius:50%}
+  #hair::after{content:"";position:absolute;inset:6px;background:#65c7ff;border-radius:50%}
+  .row{display:flex;gap:22px;align-items:flex-start;flex-wrap:wrap}
+  #panel{min-width:320px}
+  .readout{font-variant-numeric:tabular-nums;background:#161b22;border:1px solid #30363d;
+           border-radius:8px;padding:12px 14px;margin-bottom:12px}
+  .readout div{display:flex;justify-content:space-between;gap:14px}
+  .bar{height:8px;background:#21262d;border-radius:4px;overflow:hidden;margin-top:8px}
+  .bar i{display:block;height:100%;background:#3fb950;width:0}
+  label{display:flex;align-items:center;gap:9px;margin-bottom:9px}
+  label span{width:96px;flex:none;color:#8b949e}
+  button{border:0;border-radius:7px;padding:9px 15px;background:#f59b23;color:#15100a;
+         font-weight:700;cursor:pointer;margin-right:8px}
+  button.alt{background:#65c7ff;color:#07121a}
+  code{background:#161b22;padding:1px 5px;border-radius:4px;color:#79c0ff}
+  .note{color:#8b949e;font-size:12.5px;max-width:520px}
+</style>
+</head>
+<body>
+<h1>準心追蹤音測試台</h1>
+<p class="sub">直接載入 <code>gripball_webhid.js</code> 的真實 <code>syncTracking()</code>，不需要握力球、不需要校正。</p>
+
+<div class="row">
+  <div>
+    <div id="stage"><div id="duck"></div><div id="hair"></div></div>
+    <p class="note" style="margin-top:10px">
+      滑鼠移到框內就是準心（畫面比例已換算成遊戲的 256×240）。<br>
+      <b>先按下面的「開始發聲」</b> —— 瀏覽器要有一次點擊才准開音訊。
+    </p>
+  </div>
+
+  <div id="panel">
+    <div>
+      <button id="go">開始發聲</button>
+      <button id="stop" class="alt">停止</button>
+    </div>
+    <div class="readout" style="margin-top:12px">
+      <div><span>距離</span><b id="r-dist">–</b></div>
+      <div><span>closeness</span><b id="r-clos">–</b></div>
+      <div><span>locked（在 hitbox 內）</span><b id="r-lock">–</b></div>
+      <div><span>音高</span><b id="r-hz">–</b></div>
+      <div><span>音量（實際送到 gain）</span><b id="r-gain">–</b></div>
+      <div class="bar"><i id="r-bar"></i></div>
+    </div>
+    <label><span>玩家</span>
+      <select id="pid">
+        <option value="0">P1（ratio 1 / index 1.6）</option>
+        <option value="1">P2（ratio 2 / index 3.2）</option>
+        <option value="2">P3（ratio 3.5 / index 2.4）</option>
+        <option value="3">P4（ratio 0.5 / index 4）</option>
+      </select>
+    </label>
+    <label><span>lock 半徑</span>
+      <input id="lockr" type="range" min="0" max="40" step="1" value="22">
+      <b id="lockr-v" style="width:42px;text-align:right">22px</b>
+    </label>
+    <label><span>鴨子會動</span><input id="move" type="checkbox"></label>
+    <p class="note">
+      lock 半徑拉到 <b>0</b> 就是完全關掉「對準即靜音」，可以單獨聽音高與空間感。
+      這個測試台只驗證音訊；遊戲裡的判定是 Godot 的 hitbox。
+    </p>
+  </div>
+</div>
+
+<script src="gripball_webhid.js"></script>
+<script>
+(function () {
+  // The game runs at the NES resolution; the stage is 2x that so it is usable with a mouse.
+  const VW = 256, VH = 240, SCALE = 2;
+  const DIAG = Math.hypot(VW, VH);
+  const TRACK_TONE_RANGE = 0.65;      // must match gripball_input.gd
+  const stage = document.getElementById("stage");
+  const duckEl = document.getElementById("duck");
+  const hairEl = document.getElementById("hair");
+  const el = (id) => document.getElementById(id);
+
+  let running = false;
+  let duck = {x: VW * 0.5, y: VH * 0.42};
+  let hair = {x: VW * 0.5, y: VH * 0.8};
+  let vel = {x: 46, y: 23};
+  let last = null;
+
+  function place() {
+    duckEl.style.left = (duck.x * SCALE) + "px";
+    duckEl.style.top = (duck.y * SCALE) + "px";
+    hairEl.style.left = (hair.x * SCALE) + "px";
+    hairEl.style.top = (hair.y * SCALE) + "px";
+  }
+
+  stage.addEventListener("pointermove", (event) => {
+    const box = stage.getBoundingClientRect();
+    hair.x = (event.clientX - box.left) / SCALE;
+    hair.y = (event.clientY - box.top) / SCALE;
+    place();
+  });
+
+  el("lockr").addEventListener("input", () => {
+    el("lockr-v").textContent = el("lockr").value + "px";
+  });
+
+  function frame(now) {
+    if (!running) return;
+    const dt = last == null ? 0 : Math.min(0.05, (now - last) / 1000);
+    last = now;
+
+    if (el("move").checked) {
+      duck.x += vel.x * dt;
+      duck.y += vel.y * dt;
+      if (duck.x < 24 || duck.x > VW - 24) vel.x *= -1;
+      if (duck.y < 24 || duck.y > VH * 0.72) vel.y *= -1;
+      duck.x = Math.max(24, Math.min(VW - 24, duck.x));
+      duck.y = Math.max(24, Math.min(VH * 0.72, duck.y));
+      place();
+    }
+
+    const dist = Math.hypot(duck.x - hair.x, duck.y - hair.y);
+    const closeness = 1 - Math.min(dist / (DIAG * TRACK_TONE_RANGE), 1);
+    const lockRadius = Number(el("lockr").value);
+    const locked = lockRadius > 0 && dist <= lockRadius;
+    const id = Number(el("pid").value);
+
+    window.duckHuntSpatialAudio.syncTracking(
+      [{id, x: hair.x, y: hair.y, closeness, locked}], VW, VH
+    );
+
+    duckEl.classList.toggle("locked", locked);
+    el("r-dist").textContent = dist.toFixed(1) + "px";
+    el("r-clos").textContent = closeness.toFixed(3);
+    el("r-lock").textContent = locked ? "是（靜音）" : "否";
+    const probe = window.duckHuntSpatialAudio.debugVoice
+      ? window.duckHuntSpatialAudio.debugVoice(id) : null;
+    if (probe) {
+      el("r-hz").textContent = Math.round(probe.hz) + " Hz";
+      el("r-gain").textContent = probe.gain.toFixed(4);
+      el("r-bar").style.width = Math.min(100, probe.gain / 0.16 * 100) + "%";
+    }
+    requestAnimationFrame(frame);
+  }
+
+  el("go").addEventListener("click", () => {
+    if (running) return;
+    running = true;
+    last = null;
+    requestAnimationFrame(frame);
+  });
+
+  el("stop").addEventListener("click", () => {
+    running = false;
+    window.duckHuntSpatialAudio.stopAllTracking();
+    el("r-bar").style.width = "0";
+  });
+
+  place();
+})();
+</script>
+</body>
+</html>

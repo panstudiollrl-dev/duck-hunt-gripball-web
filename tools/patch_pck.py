@@ -2,9 +2,10 @@
 """
 把 repo 根目錄的來源檔打包回 index.pck，並同步 index.html 的 fileSizes。
 
-目前會替換兩個資源：
-    gripball_webhid.js  → res://web/gripball_webhid.js
-    duck.gd.reference   → res://scenes/duck.gd
+目前會替換三個資源：
+    gripball_webhid.js       → res://web/gripball_webhid.js
+    duck.gd.reference        → res://scenes/duck.gd
+    gripball_input.gd.reference → res://scenes/gripball_input.gd
 
 用法：
     python tools/patch_pck.py
@@ -30,11 +31,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PCK = ROOT / "index.pck"
 HTML = ROOT / "index.html"
-# 來源檔 → pck 內資源路徑。duck.gd 在 repo root 叫 duck.gd.reference，
-# 免得 Godot 專案或編輯器把 root 的 duck.gd 誤認成專案檔。
+# 來源檔 → pck 內資源路徑。.gd 檔在 repo root 都加 .reference 後綴，
+# 免得 Godot 專案或編輯器把 root 的 .gd 誤認成專案檔。
 REPLACEMENTS = {
     "gripball_webhid.js": "res://web/gripball_webhid.js",
     "duck.gd.reference": "res://scenes/duck.gd",
+    "gripball_input.gd.reference": "res://scenes/gripball_input.gd",
 }
 ALIGN = 16
 

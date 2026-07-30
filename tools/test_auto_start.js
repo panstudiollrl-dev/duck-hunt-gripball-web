@@ -362,18 +362,70 @@ console.log("\nRemoving the click did not take audio unlocking with it");
   check("it listens in capture phase and passively, so game input is unaffected",
         /capture: true, passive: true/.test(unlockSrc));
   check("it only stops listening once a context is actually running",
-        /ctx && ctx\.state === "running"[\s\S]*?removeEventListener/.test(unlockSrc),
-        "must not unhook on the first click if Godot has no context yet");
+        /contexts\.length && contexts\.every\(\(ctx\) => ctx\.state === "running"\)[\s\S]*?removeEventListener/
+          .test(unlockSrc),
+        "must not unhook on the first click while a context is still missing or suspended");
   check("a rejected resume() cannot throw out of the listener", /\.catch\(/.test(unlockSrc));
 
-  // And the player is told, rather than being left with a silent game that looks broken.
+  // The bug Pan hit after the first attempt shipped: the unlock only ever looked at
+  // window.GodotAudio.ctx, and measuring the real build showed that object is module-scoped
+  // inside index.js and never put on window - so window.GodotAudio is permanently undefined and
+  // the whole unlock was a no-op. The context that actually plays the ducks is the spatial
+  // module's own (measureOutput() reports sharedWithGodot:false).
+  const ctxSrc = grab(/function audioContexts\(\) \{[\s\S]*?\n  \}/, "audioContexts");
+  check("the unlock does not rely on window.GodotAudio alone, which never exists here",
+        /duckHuntSpatialAudio/.test(ctxSrc),
+        "audioContexts() must reach the spatial module's own context");
+  check("the spatial module exposes its context so the gesture can resume it",
+        /context: \(\) => ctx,/.test(src));
+  check("...and can create it inside the gesture, the one time it starts out running",
+        /ensureContext: \(\) => getContext\(\),/.test(src) &&
+        /spatial\.ensureContext\(\)/.test(unlockSrc));
+  // The call has to be reached from the live module, not from something that can never be
+  // truthy. Nulling the lookup left the textual check above passing, which it should not.
+  check("...and the ensureContext call is reached via the real module object",
+        /const spatial = window\.duckHuntSpatialAudio;[\s\S]{0,120}spatial\.ensureContext\(\)/
+          .test(unlockSrc),
+        "ensureContext must be called on window.duckHuntSpatialAudio");
+  check("context() reports rather than creates, so it cannot build a suspended one early",
+        !/context: \(\) => getContext\(\)/.test(src));
+  // Strip comments first: the prose in this function talks about awaiting, and matching that
+  // was a false positive on the first version of this assertion.
+  const unlockCode = unlockSrc.replace(/\/\/[^\n]*/g, "");
+  check("the gesture listener is not async and does not await before resuming",
+        !/\basync\b/.test(unlockCode) && !/\bawait\b/.test(unlockCode),
+        "awaiting first spends the user activation and the resume is then refused");
+
+  // Godot's own context is unreachable from here, so it gets handed a real gesture instead.
+  const pokeSrc = grab(/function pokeCanvasForAudio\(\) \{[\s\S]*?\n  \}/, "pokeCanvasForAudio");
+  check("a gesture is replayed at the canvas for Godot's own audio driver",
+        /dispatchEvent/.test(pokeSrc) && /getElementById\("canvas"\)/.test(pokeSrc));
+  check("the canvas poke cannot recurse forever through the window listener",
+        /if \(poking\) return;/.test(pokeSrc) && /poking = false;/.test(pokeSrc),
+        "measured as 'Maximum call stack size exceeded' on the first click without this");
+  check("...and the guard is released even if a dispatch throws",
+        /finally \{\s*\n\s*poking = false;/.test(pokeSrc));
+
+  // resumeAudioAndFocusCanvas had the same window.GodotAudio bug, so it also did nothing.
+  const rafSrc = grab(/async function resumeAudioAndFocusCanvas\(\) \{[\s\S]*?\n  \}/,
+                      "resumeAudioAndFocusCanvas");
+  check("resumeAudioAndFocusCanvas resumes every context, not just Godot's",
+        /audioContexts\(\)/.test(rafSrc), "still keyed off window.GodotAudio only");
+  check("...and does not await before poking the canvas, which would spend the activation",
+        rafSrc.indexOf("pokeCanvasForAudio") < rafSrc.lastIndexOf("await Promise.all"),
+        "the poke must happen before the await");
+
+  // And the player is told, rather than being left with a silent game that looks broken. This
+  // is the one case that genuinely cannot be fixed in code: a returning player whose balls are
+  // already authorized can reach play with zero clicks, and no API can unlock audio then.
   const startSrc = grab(/async function startGame\(withCalibration\)[\s\S]*?\n  \}/, "startGame");
   check("the ready message warns when audio is still blocked",
         /audioIsBlocked\(\)/.test(startSrc), "no audio check in startGame");
   check("...and says what to do about it", /點一下畫面開聲音/.test(startSrc));
-  check("audioIsBlocked only reports 'blocked' for a genuinely suspended context",
-        /ctx\.state === "suspended"/.test(
-          grab(/function audioIsBlocked\(\) \{[\s\S]*?\n  \}/, "audioIsBlocked")));
+  check("audioIsBlocked only reports blocked for a context that exists and is suspended",
+        /some\(\(ctx\) => ctx\.state === "suspended"\)/.test(
+          grab(/function audioIsBlocked\(\) \{[\s\S]*?\n  \}/, "audioIsBlocked")),
+        "'no context yet' must not read as blocked, or every start gets a scary note");
 }
 
 console.log("\nThe window is long enough to plug in a second ball, short enough to feel automatic");

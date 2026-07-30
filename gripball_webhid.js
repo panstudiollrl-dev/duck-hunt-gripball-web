@@ -481,9 +481,32 @@
     applyHudVisibility();
   }
 
+  /**
+   * Every AudioContext on the page that might need waking.
+   *
+   * window.GodotAudio was the only one the first version of this looked at, and measuring the
+   * real build showed why that silently did nothing: Godot's GodotAudio object is module-scoped
+   * inside index.js and is never put on window, so window.GodotAudio is permanently undefined.
+   * The context that actually plays the duck sounds is the spatial module's own (measureOutput()
+   * reports sharedWithGodot:false), and Godot's is only reachable through the engine itself.
+   *
+   * So: resume ours directly, and drive Godot's the only way the page can - by dispatching a
+   * real click at the canvas, which is what its own audio driver listens for.
+   */
+  function audioContexts() {
+    const found = [];
+    const godot = window.GodotAudio && window.GodotAudio.ctx;
+    if (godot) found.push(godot);
+    const spatial = window.duckHuntSpatialAudio;
+    const own = spatial && spatial.context && spatial.context();
+    if (own && own !== godot) found.push(own);
+    return found;
+  }
+
   function audioIsBlocked() {
-    const ctx = window.GodotAudio && window.GodotAudio.ctx;
-    return Boolean(ctx) && ctx.state === "suspended";
+    // Only report blocked for a context that exists and is suspended. "No context yet" is not
+    // the same as blocked - saying so would put a scary note on every start.
+    return audioContexts().some((ctx) => ctx.state === "suspended");
   }
 
   /**
@@ -492,22 +515,38 @@
    * Browsers only let an AudioContext start from inside a gesture, and pressing the ball is a
    * HID event, not a gesture - so it can never unlock audio by itself. For a returning player
    * the balls are already authorized, restoreAuthorizedDevices() enrols them with no click at
-   * all, and the game can now reach play having never seen one: correct graph, no sound.
+   * all, and the game can reach play having never seen one: correct graph, no sound.
    *
-   * So resume from the first real click or keypress anywhere on the page, once. Capture phase
-   * and passive, so it cannot interfere with the game's own input handling.
+   * Resume from the first real interaction anywhere on the page - and note that the click on
+   * 連接/新增握力球 counts, since WebHID cannot show its chooser without one. That is why this
+   * has to work from any element, not only the canvas.
    */
   function unlockAudioOnFirstGesture() {
-    const events = ["pointerdown", "keydown", "touchstart"];
+    const events = ["pointerdown", "pointerup", "keydown", "touchstart", "click"];
     const unlock = () => {
-      const ctx = window.GodotAudio && window.GodotAudio.ctx;
-      if (ctx && ctx.state === "suspended") {
-        Promise.resolve(ctx.resume()).catch((error) =>
-          console.warn("Could not resume audio on gesture", error));
+      // Create ours now if it does not exist yet. Inside a real gesture is the one moment a
+      // context can be born already running; it is created lazily, so without this the first
+      // sound would build it later from a timer and it would start out suspended.
+      const spatial = window.duckHuntSpatialAudio;
+      if (spatial && spatial.ensureContext) {
+        try { spatial.ensureContext(); } catch (error) {
+          console.warn("Could not create the audio context on gesture", error);
+        }
       }
-      // Only stop listening once there is a context and it is running; the first click can
-      // easily land before Godot has created one.
-      if (ctx && ctx.state === "running") {
+      const contexts = audioContexts();
+      for (const ctx of contexts) {
+        if (ctx.state === "suspended") {
+          // Called synchronously inside the gesture handler, which is what the autoplay policy
+          // requires; awaiting anything first would spend the activation.
+          Promise.resolve(ctx.resume()).catch((error) =>
+            console.warn("Could not resume audio on gesture", error));
+        }
+      }
+      // Godot's own context is unreachable from here, so hand it a real gesture at the canvas.
+      pokeCanvasForAudio();
+      // Only stop listening once there is at least one context and none are suspended: the
+      // first click usually lands before any context exists at all.
+      if (contexts.length && contexts.every((ctx) => ctx.state === "running")) {
         for (const name of events) window.removeEventListener(name, unlock, true);
       }
     };
@@ -516,17 +555,48 @@
     }
   }
 
-  async function resumeAudioAndFocusCanvas() {
-    if (window.GodotAudio && window.GodotAudio.ctx && window.GodotAudio.ctx.state !== "running") {
-      await window.GodotAudio.ctx.resume();
-    }
+  /**
+   * Godot's web audio driver unlocks from a gesture on its own canvas. A click on the HUD is a
+   * real gesture, but it does not reach the canvas, so replay one there. Synthetic events do
+   * not carry activation on their own - they work here only because this runs inside a real
+   * gesture, which is the whole reason it is called from the unlock listener.
+   */
+  let poking = false;
+  function pokeCanvasForAudio() {
     const canvas = document.getElementById("canvas");
     if (!canvas) return;
-    canvas.focus();
-    canvas.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, pointerId: 1, pointerType: "mouse"}));
-    canvas.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, button: 0}));
-    canvas.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, button: 0}));
-    canvas.dispatchEvent(new PointerEvent("pointerup", {bubbles: true, pointerId: 1, pointerType: "mouse"}));
+    // The events dispatched below bubble up to the window listener that called this, which
+    // would poke again, forever. (Measured: "Maximum call stack size exceeded" on the first
+    // click.) A re-entrancy guard is enough, since the whole poke is synchronous.
+    if (poking) return;
+    poking = true;
+    try {
+      canvas.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true, pointerId: 1, pointerType: "mouse"}));
+      canvas.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, button: 0}));
+      canvas.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, button: 0}));
+      canvas.dispatchEvent(new PointerEvent("pointerup", {bubbles: true, pointerId: 1, pointerType: "mouse"}));
+      canvas.dispatchEvent(new MouseEvent("click", {bubbles: true, button: 0}));
+    } catch (error) {
+      console.warn("Could not poke the canvas for audio", error);
+    } finally {
+      poking = false;
+    }
+  }
+
+  async function resumeAudioAndFocusCanvas() {
+    // Resume every context, not just window.GodotAudio.ctx - which never exists in this build,
+    // so this used to do nothing at all for audio. Not awaited before the canvas poke below:
+    // when this is called from a click handler, awaiting first would spend the activation.
+    const resumes = audioContexts()
+      .filter((ctx) => ctx.state !== "running")
+      .map((ctx) => Promise.resolve(ctx.resume()).catch((error) =>
+        console.warn("Could not resume audio", error)));
+    const canvas = document.getElementById("canvas");
+    if (canvas) {
+      canvas.focus();
+      pokeCanvasForAudio();
+    }
+    await Promise.all(resumes);
   }
 
   async function addDevices() {
@@ -2204,6 +2274,13 @@
 
     window.duckHuntSpatialAudio = {
       play, syncTracking, stopAllTracking, debugVoice, resumeAudio, measureOutput,
+      // Exposed so the gesture unlock can resume this context directly. It cannot go through
+      // resumeAudio(), which is async: awaiting anything before resume() spends the user
+      // activation and the resume is then refused. context() deliberately does not create one -
+      // it reports what exists - while ensureContext() builds it inside the gesture, which is
+      // the one moment a new context starts out running rather than suspended.
+      context: () => ctx,
+      ensureContext: () => getContext(),
     };
 
     // Needs a live AudioContext to decode into, so it can only run after a user gesture.

@@ -22,10 +22,31 @@
 球在倒數期間拔掉會取消（不會開一場沒人的遊戲）；按「鍵盤測試」也會取消。自動開始失敗
 時**不會**每 2.5 秒重試（那會把錯誤訊息一直洗掉），而是把控制列叫出來，等你按「開始遊戲」。
 
-**聲音的注意事項**：瀏覽器只允許在使用者手勢裡啟動 AudioContext，而原本那個手勢就是按
-「開始遊戲」。自動開始把它拿掉了，而握球是 HID 事件、不算手勢，所以恢復授權的老玩家有可能
-一次都沒點過畫面就進了遊戲 —— 圖是對的但沒聲音。因此有 `unlockAudioOnFirstGesture()`：
-頁面上第一次點擊或按鍵就 resume。真的還沒解鎖時，開始訊息會多一句「點一下畫面開聲音」。
+## 聲音的解鎖（autoplay policy）
+
+瀏覽器只允許在使用者手勢裡啟動 AudioContext，而原本那個手勢就是按「開始遊戲」。自動開始把它
+拿掉了，而握球是 HID 事件、不算手勢，所以不會自己解鎖。
+
+`unlockAudioOnFirstGesture()` 在頁面上**任何**第一次點擊或按鍵時解鎖。重點是「連接/新增
+握力球」那一下就算 —— WebHID 沒有手勢根本開不了選擇視窗，所以第一次玩的人本來就會點到一次，
+不需要再額外點畫面。
+
+有兩個實測踩到的細節：
+
+- **`window.GodotAudio` 在這個 build 裡永遠是 `undefined`。** Godot 的 `GodotAudio` 物件是
+  `index.js` 內的 module scope 變數，從來沒掛到 `window` 上。第一版的解鎖只看它，所以整段
+  其實什麼都沒做。真正在放鴨子叫聲的是這支腳本自己建的 context（`measureOutput()` 會回報
+  `sharedWithGodot:false`）。現在 `audioContexts()` 兩個都收，並且在手勢裡才 `ensureContext()`
+  建立 —— 那是新 context 唯一會直接是 running 而不是 suspended 的時機。
+- **resume 必須同步呼叫。** listener 不能是 `async`，先 `await` 任何東西都會把 user
+  activation 花掉，之後 resume 就會被拒絕。
+- Godot 自己的 context 從外面碰不到，所以改成往 canvas 補送一次真的手勢
+  （`pokeCanvasForAudio()`）。那些事件會冒泡回 window 上的 listener 再觸發自己，所以有
+  re-entrancy guard —— 沒有的話第一次點擊就 `Maximum call stack size exceeded`。
+
+**唯一修不掉的情況**：老玩家的球已經授權過，`getDevices()` 自動恢復、可以全程零點擊進遊戲 ——
+這時候瀏覽器就是不給聲音，任何 API 都繞不過。所以那種情況開始訊息會多一句
+「點一下畫面開聲音」，而不是安靜地沒聲音讓人以為壞了。
 
 ## 控制列（HUD）
 

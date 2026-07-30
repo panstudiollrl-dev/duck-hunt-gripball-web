@@ -22,6 +22,7 @@ function grab(re, label) {
 
 const sourceVectorSrc = grab(/function sourceVector\(x, y, vw, vh\) \{[\s\S]*?\n    \}/, "sourceVector");
 const connectHrtfSrc = grab(/function connectHrtf\(source, vector, options\) \{[\s\S]*?\n    \}/, "connectHrtf");
+const makeAirFilterSrc = grab(/function makeAirFilter\(context, vector\) \{[\s\S]*?\n    \}/, "makeAirFilter");
 
 // Minimal Web Audio stand-ins: we only care about the panner position that gets set.
 const harness = `
@@ -41,9 +42,16 @@ function getContext() {
       return p;
     },
     createGain() { return {gain: {value: 0}, connect() {}}; },
+    createBiquadFilter() {
+      return {
+        type: "", connect() {},
+        frequency: {value: 0, setValueAtTime(v) { this.value = v; }},
+      };
+    },
   };
 }
 ${sourceVectorSrc}
+${makeAirFilterSrc}
 ${connectHrtfSrc}
 return {
   sourceVector,

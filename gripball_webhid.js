@@ -905,6 +905,25 @@
     let ctx = null;
     let master = null;
 
+    // Real measured HRIRs (SADIE-style, 48kHz float32 stereo, 256 taps) convolved per
+    // sound, instead of the browser's own generic HRTF panner. Technique from the
+    // SonicSquid G07_Binamix prototype (github.com/breampan/SonicSquid); the dataset is
+    // this project's own assets/hrir/, which unlike SonicSquid's 72-azimuth set also has
+    // elevation. Falls back to PannerNode if the IRs can't be loaded.
+    const HRIR_DIR = "assets/hrir/";
+    // Convolving a mono source with a stereo IR loses the ~6dB you'd get from a panner's
+    // own gain staging; measured against the PannerNode path to match loudness.
+    const HRIR_BOOST = 1.8;
+    const hrir = {
+      ready: false,
+      failed: false,
+      loading: null,
+      grid: null,     // ele -> sorted azimuth array
+      byKey: null,    // "azi,ele" -> filename
+      buffers: {},    // filename -> AudioBuffer (lazily decoded)
+      pending: {},    // filename -> Promise
+    };
+
     function getContext() {
       if (!ctx) {
         ctx = window.GodotAudio && window.GodotAudio.ctx
@@ -960,6 +979,104 @@
       return buffers[name];
     }
 
+    // Only the manifest is fetched up front (~17KB). The IR wavs themselves are pulled in
+    // on demand: the full set is 344 files and a duck only ever needs the handful of
+    // angles it actually flies through, so preloading all of them would cost far more
+    // than it saves.
+    function loadHrirIndex() {
+      if (hrir.ready || hrir.failed) return Promise.resolve(hrir.ready);
+      if (hrir.loading) return hrir.loading;
+      hrir.loading = (async () => {
+        try {
+          const response = await fetch(`${HRIR_DIR}manifest.json`);
+          if (!response.ok) throw new Error(`HRIR manifest ${response.status}`);
+          const entries = await response.json();
+          if (!Array.isArray(entries) || !entries.length) throw new Error("HRIR manifest empty");
+          const grid = {};
+          const byKey = {};
+          for (const entry of entries) {
+            if (!entry || typeof entry.azi !== "number" || typeof entry.ele !== "number") continue;
+            (grid[entry.ele] = grid[entry.ele] || []).push(entry.azi);
+            byKey[`${entry.azi},${entry.ele}`] = entry.name;
+          }
+          const elevations = Object.keys(grid).map(Number);
+          if (!elevations.length) throw new Error("HRIR manifest has no usable entries");
+          for (const ele of elevations) grid[ele].sort((a, b) => a - b);
+          hrir.grid = grid;
+          hrir.elevations = elevations.sort((a, b) => a - b);
+          hrir.byKey = byKey;
+          hrir.ready = true;
+        } catch (error) {
+          console.warn("Duck HRIR convolution unavailable, using PannerNode", error);
+          hrir.failed = true;
+        }
+        return hrir.ready;
+      })();
+      return hrir.loading;
+    }
+
+    function nearestIn(values, target) {
+      let best = values[0];
+      let bestDelta = Infinity;
+      for (const value of values) {
+        const delta = Math.abs(value - target);
+        if (delta < bestDelta) { bestDelta = delta; best = value; }
+      }
+      return best;
+    }
+
+    // Azimuth wraps, so 358 deg is 4 deg away from 2 deg - a plain nearest search would
+    // pick something on the wrong side of the head for anything near straight ahead.
+    function nearestAzimuth(azimuths, target) {
+      let best = azimuths[0];
+      let bestDelta = Infinity;
+      for (const azi of azimuths) {
+        const raw = Math.abs(azi - target);
+        const delta = Math.min(raw, 360 - raw);
+        if (delta < bestDelta) { bestDelta = delta; best = azi; }
+      }
+      return best;
+    }
+
+    // Dataset convention, verified by measuring the shipped IRs: azimuth increases
+    // counter-clockwise, so azi 90 is the LEFT ear (peak arrives 28 samples early on the
+    // left, +20dB louder) and azi 270 is the right. A duck on the right of the screen
+    // (lateral +1) therefore has to map to 270, not 90.
+    function hrirNameFor(vector) {
+      if (!hrir.ready) return null;
+      const lateral = Math.max(-1, Math.min(1, vector.lateral));
+      // Ducks are on a screen in front of the listener, never behind, so the useful arc is
+      // the frontal one: straight ahead is 0 and we swing +/-90 deg to the sides.
+      const degrees = lateral * 90;
+      const azimuth = ((360 - degrees) % 360 + 360) % 360;
+      const elevation = Math.max(-90, Math.min(90, vector.vertical * 30));
+      const ele = nearestIn(hrir.elevations, elevation);
+      const azi = nearestAzimuth(hrir.grid[ele], azimuth);
+      return hrir.byKey[`${azi},${ele}`] || null;
+    }
+
+    function loadHrirBuffer(name) {
+      if (hrir.buffers[name]) return Promise.resolve(hrir.buffers[name]);
+      if (hrir.pending[name]) return hrir.pending[name];
+      const context = getContext();
+      hrir.pending[name] = (async () => {
+        try {
+          const response = await fetch(HRIR_DIR + name);
+          if (!response.ok) throw new Error(`HRIR ${name} ${response.status}`);
+          const data = await response.arrayBuffer();
+          const buffer = await context.decodeAudioData(data);
+          hrir.buffers[name] = buffer;
+          return buffer;
+        } catch (error) {
+          console.warn(`Duck HRIR ${name} failed to load`, error);
+          return null;
+        } finally {
+          delete hrir.pending[name];
+        }
+      })();
+      return hrir.pending[name];
+    }
+
     // x/y are Godot *viewport* coordinates, so the divisor has to be the game's own
     // viewport size (vw/vh, sent by duck.gd). window.innerWidth/Height is a different
     // coordinate space entirely: letterboxing, devicePixelRatio scaling, or a window
@@ -990,16 +1107,31 @@
       return out;
     }
 
+    // Air absorption: the further away a sound is, the more high end it loses. Technique
+    // from SonicSquid's DraggableSound.airFilter. Distance read poorly when it was carried
+    // by volume rolloff alone - a quieter sound is easy to mistake for a different sound,
+    // a duller one reads as further away.
+    function makeAirFilter(context, vector) {
+      const airFilter = context.createBiquadFilter();
+      airFilter.type = "lowpass";
+      const depth = Math.min(1, vector.dist);
+      airFilter.frequency.setValueAtTime(
+        Math.max(1200, 16000 - depth * 11000), context.currentTime
+      );
+      return airFilter;
+    }
+
     function connectHrtf(source, vector, options) {
       const context = getContext();
       const panner = context.createPanner();
+      const airFilter = makeAirFilter(context, vector);
       const gain = context.createGain();
       const envelope = context.createGain();
       panner.panningModel = "HRTF";
       panner.distanceModel = "inverse";
       panner.refDistance = 1;
       panner.maxDistance = 7;
-      panner.rolloffFactor = 0.22;
+      panner.rolloffFactor = 0.45;
       panner.coneInnerAngle = 360;
       panner.coneOuterAngle = 360;
       panner.coneOuterGain = 1;
@@ -1016,10 +1148,53 @@
       gain.gain.value = options.gain || 0.88;
       envelope.gain.value = 1;
       source.connect(envelope);
-      envelope.connect(panner);
+      envelope.connect(airFilter);
+      airFilter.connect(panner);
       panner.connect(gain);
       gain.connect(master);
       return envelope;
+    }
+
+    // Real-HRIR path. These are one-shot sounds, so a single convolver per sound is
+    // enough - the A/B crossfade SonicSquid needs is only for a continuously sounding
+    // source that moves between angles mid-playback.
+    function connectHrir(source, vector, options, irBuffer) {
+      const context = getContext();
+      const airFilter = makeAirFilter(context, vector);
+      const convolver = context.createConvolver();
+      // The IRs already carry the correct interaural level difference; letting the browser
+      // normalise them would flatten exactly the cue we came here for.
+      convolver.normalize = false;
+      convolver.buffer = irBuffer;
+      const gain = context.createGain();
+      const envelope = context.createGain();
+      // A convolver has no distance model of its own, so fold the inverse-square rolloff
+      // in by hand, matching the PannerNode path's refDistance 1 / rolloff 0.45.
+      const distance = 1 + Math.min(1.8, vector.dist * 0.7);
+      const rolloff = 1 / (1 + 0.45 * (distance - 1));
+      gain.gain.value = (options.gain || 0.88) * HRIR_BOOST * rolloff;
+      envelope.gain.value = 1;
+      source.connect(envelope);
+      envelope.connect(airFilter);
+      airFilter.connect(convolver);
+      convolver.connect(gain);
+      gain.connect(master);
+      return envelope;
+    }
+
+    // Prefer measured HRIRs; fall back to the browser's HRTF panner whenever the dataset
+    // isn't there yet or the angle we want failed to load. Never blocks on the network:
+    // if the IR isn't already decoded the sound plays through the panner rather than late.
+    function spatialize(source, vector, options) {
+      if (hrir.ready) {
+        const name = hrirNameFor(vector);
+        if (name) {
+          const buffer = hrir.buffers[name];
+          if (buffer) return connectHrir(source, vector, options, buffer);
+          loadHrirBuffer(name);
+        }
+      }
+      return connectHrtf(source, vector, options);
     }
 
     async function play(name, x, y, vw, vh) {
@@ -1032,7 +1207,7 @@
           : {gain: name === "scream" ? 0.92 : name === "drop_hit" ? 0.9 : 0.84};
         const source = context.createBufferSource();
         source.buffer = makeMonoBuffer(buffer);
-        const envelope = connectHrtf(source, vector, options);
+        const envelope = spatialize(source, vector, options);
         if (name === "drop_fall") {
           source.playbackRate.setValueAtTime(1.55, context.currentTime);
           source.playbackRate.exponentialRampToValueAtTime(0.34, context.currentTime + 0.38);
@@ -1051,7 +1226,34 @@
       }
     }
 
+    // spatialize() never waits on the network, so without this the first few sounds of a
+    // session would all fall back to the panner. Warming a coarse arc across the screen
+    // (~30 files) means the common angles are already decoded before the first duck is
+    // shot; anything in between is pulled in as it comes up.
+    async function prewarmHrir() {
+      if (!await loadHrirIndex()) return;
+      const wanted = new Set();
+      for (let i = 0; i <= 10; i += 1) {
+        const lateral = -1 + (i / 10) * 2;
+        for (const vertical of [0.6, 0, -0.4]) {
+          const name = hrirNameFor({lateral, vertical, dist: 0});
+          if (name) wanted.add(name);
+        }
+      }
+      await Promise.all([...wanted].map(loadHrirBuffer));
+    }
+
     window.duckHuntSpatialAudio = {play};
+
+    // Needs a live AudioContext to decode into, so it can only run after a user gesture.
+    // Kick it off on the first interaction and let it finish in the background.
+    const warmOnGesture = () => {
+      window.removeEventListener("pointerdown", warmOnGesture);
+      window.removeEventListener("keydown", warmOnGesture);
+      prewarmHrir().catch((error) => console.warn("Duck HRIR prewarm failed", error));
+    };
+    window.addEventListener("pointerdown", warmOnGesture);
+    window.addEventListener("keydown", warmOnGesture);
   }
 
   installDuckSpatialAudio();

@@ -338,7 +338,7 @@ func _play_duck_drop_hit() -> void:
 	# shoot() awaits 0.5s before calling this; the duck can leave the screen and be
 	# queued for deletion in the meantime, and _play_web_meshrir_sound reads
 	# global_position / get_viewport_rect().
-	if not is_inside_tree():
+	if not is_instance_valid(self) or not is_inside_tree():
 		return
 	# _play_positioned_duck_sound maps this player to "drop_hit" and tries the Web HRTF
 	# bridge itself, falling back to a positioned AudioStreamPlayer2D off the web.

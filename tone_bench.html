@@ -51,8 +51,16 @@
       <button id="go">開始發聲</button>
       <button id="stop" class="alt">停止</button>
     </div>
+    <div style="margin-top:10px">
+      <button id="beep" class="alt">① 測試喇叭（不經過任何空間音訊）</button>
+    </div>
+    <p class="note" style="margin:8px 0 0">
+      <b>如果連 ① 都聽不到</b>，問題就不在追蹤音的程式，而是這個頁面／這台裝置的音訊輸出
+      （分頁被靜音、輸出裝置選錯、系統音量）。<b>先確認 ① 有聲音再往下。</b>
+    </p>
     <div class="readout" style="margin-top:12px">
       <div><span>AudioContext</span><b id="r-state">尚未開啟</b></div>
+      <div><span>實測輸出（RMS）</span><b id="r-out">–</b></div>
       <div><span>距離</span><b id="r-dist">–</b></div>
       <div><span>closeness</span><b id="r-clos">–</b></div>
       <div><span>按壓</span><b id="r-press">放開</b></div>
@@ -91,6 +99,7 @@
   const VW = 256, VH = 240, SCALE = 2;
   const DIAG = Math.hypot(VW, VH);
   const TRACK_TONE_RANGE = 0.65;      // must match gripball_input.gd
+  const TONE_PEAK_REF = 0.24;         // must match TONE_PEAK_GAIN; only scales the meter
   const stage = document.getElementById("stage");
   const duckEl = document.getElementById("duck");
   const hairEl = document.getElementById("hair");
@@ -205,11 +214,23 @@
     if (probe) {
       el("r-hz").textContent = Math.round(probe.hz) + " Hz";
       el("r-gain").textContent = probe.gain.toFixed(4);
-      el("r-bar").style.width = Math.min(100, probe.gain / 0.16 * 100) + "%";
+      // Scale off the module's own peak so the bar stays meaningful when it is retuned.
+      el("r-bar").style.width = Math.min(100, probe.gain / TONE_PEAK_REF * 100) + "%";
     } else {
       el("r-hz").textContent = "–";
       el("r-gain").textContent = "0（沒有 voice）";
       el("r-bar").style.width = "0";
+    }
+
+    // The value that actually matters: sampled from the signal, not read back off a param.
+    const out = window.duckHuntSpatialAudio.measureOutput
+      ? window.duckHuntSpatialAudio.measureOutput() : null;
+    if (out) {
+      el("r-state").textContent = out.state +
+        (out.sharedWithGodot ? "（與 Godot 共用）" : "");
+      el("r-out").textContent = out.rms > 1e-6
+        ? out.rms.toFixed(5) + "  (" + out.db.toFixed(1) + " dB) ✓ 有訊號"
+        : "0  ✗ 完全沒有訊號到達輸出";
     }
     requestAnimationFrame(frame);
   }
@@ -229,6 +250,31 @@
     running = true;
     last = null;
     requestAnimationFrame(frame);
+  });
+
+  // Deliberately its own AudioContext, its own oscillator, straight to destination. Shares
+  // nothing with the module, so it separates "my audio code is broken" from "this page or
+  // device is not producing sound at all".
+  el("beep").addEventListener("click", async () => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const c = new AC();
+    if (c.state === "suspended") await c.resume();
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = "sine";
+    o.frequency.value = 440;
+    g.gain.value = 0;
+    o.connect(g);
+    g.connect(c.destination);
+    const t = c.currentTime;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.25, t + 0.02);
+    g.gain.setValueAtTime(0.25, t + 0.38);
+    g.gain.linearRampToValueAtTime(0, t + 0.4);
+    o.start(t);
+    o.stop(t + 0.45);
+    el("beep").textContent = "① 播了 440Hz（state: " + c.state + "）";
+    setTimeout(() => { c.close(); }, 800);
   });
 
   el("stop").addEventListener("click", () => {

@@ -42,7 +42,10 @@ const pieces = [
   grab(/const TONE_TIMBRES = \[[\s\S]*?\n    \];/, "TONE_TIMBRES"),
   grab(/function timbreFor\(id\) \{[\s\S]*?\n    \}/, "timbreFor"),
   grab(/function lockEnvelope\(closeness, locked\) \{[\s\S]*?\n    \}/, "lockEnvelope"),
+  // Compensates the IRs' weak low end; test_hrir_loudness.js checks the dB arithmetic.
+  grab(/function tiltCompensation\(hz\) \{[\s\S]*?\n    \}/, "tiltCompensation"),
   grab(/function shareOfGain\(count\) \{[\s\S]*?\n    \}/, "shareOfGain"),
+  grab(/function hrirGainFor\(name, buffer\) \{[\s\S]*?\n    \}/, "hrirGainFor"),
   grab(/function makeTrackingVoice\(id\) \{[\s\S]*?\n    \}/, "makeTrackingVoice"),
   grab(/function setVoicePosition\(voice, vector\) \{[\s\S]*?\n    \}/, "setVoicePosition"),
   grab(/function updateVoice\(voice, closeness, vector, share, locked\) \{[\s\S]*?\n    \}/,
@@ -53,7 +56,7 @@ const pieces = [
 
 const CONSTANTS = ["TONE_MIN_HZ", "TONE_MAX_HZ", "TONE_PEAK_GAIN", "TONE_FADE_MS",
                    "TONE_GLIDE_MS", "TONE_LOCK_START", "TONE_LOCK_SILENT", "TONE_LOCK_MS",
-                   "HRIR_BOOST"];
+                   "TONE_TILT_DB_PER_OCT", "TONE_TILT_REF_HZ", "HRIR_MATCH", "HRIR_MIN_NORM"];
 
 // Stub Web Audio. Every node records its kind and outgoing connections; AudioParams record
 // every scheduled change so ramps can be inspected. The stub's label is "kind", not "type",
@@ -62,6 +65,7 @@ const harness = `
   ${CONSTANTS.map((c) => `const ${c} = ${constant(c)};`).join("\n  ")}
   let nodes = [];
   let now = 0;
+  const hrirNorms = {};
   const master = {kind: "master", outputs: []};
   function param(value) {
     return {
@@ -108,6 +112,7 @@ const harness = `
     nodes: () => nodes,
     fetched: () => fetched,
     reset() { nodes = []; fetched = []; voices.clear(); },
+    hrirGainFor, tiltCompensation,
     advance(dt) { now += dt; },
     time: () => now,
   };
@@ -137,7 +142,13 @@ function installIndex(withBuffers) {
   for (const ele of elevations) grid[ele].sort((a, b) => a - b);
   const buffers = {};
   if (withBuffers) {
-    for (const e of manifest) buffers[e.name] = {label: e.name, length: 256};
+    for (const e of manifest) {
+      const taps = new Float32Array(256);
+      taps[0] = 0.08;   // a norm typical of the shipped IRs, so gains come out realistic
+      buffers[e.name] = {
+        label: e.name, length: 256, numberOfChannels: 1, getChannelData: () => taps,
+      };
+    }
   }
   Object.assign(mod.hrir, {ready: true, failed: false, grid, byKey, elevations, buffers,
                            pending: {}});
@@ -203,6 +214,10 @@ console.log("\nThe tone falls silent at lock-on, and returns when the aim drifts
   mod.reset();
   // Sampled relative to the real thresholds, so retuning the fade does not silently turn
   // these into assertions about a band that no longer exists.
+  // Same octave interpolation updateVoice uses, needed to undo the pitch-dependent tilt.
+  const pitchAt = (c) => constant("TONE_MIN_HZ") *
+    Math.pow(2, Math.log2(constant("TONE_MAX_HZ") / constant("TONE_MIN_HZ")) *
+                Math.max(0, Math.min(1, c)));
   const START = constant("TONE_LOCK_START");
   const SILENT = constant("TONE_LOCK_SILENT");
   const MID = (START + SILENT) / 2;
@@ -218,9 +233,31 @@ console.log("\nThe tone falls silent at lock-on, and returns when the aim drifts
   check("audible while the aim is still off the duck", levels[0] > 0.001 && levels[1] > 0.001,
         levels.slice(0, 2).join(","));
   check("fully silent once aimed at the duck", levels[4] === 0, String(levels[4]));
+  // The requested gain is no longer a stand-in for loudness: it now carries the low-end tilt
+  // correction, which *falls* as the pitch rises (on purpose - that is what keeps the
+  // delivered level flat). So divide the tilt back out to see the swell on its own, the way
+  // the ear hears it. Comparing raw gains here would read the correction as a fade-out.
+  const swellOnly = probes.map((c, i) =>
+    levels[i] / mod.tiltCompensation(pitchAt(c)));
+  console.log("       swell alone: " + swellOnly.map((g) => g.toFixed(4)).join(" "));
+  check("the swell itself rises towards the duck, before lock-out takes over",
+        swellOnly[1] > swellOnly[0], swellOnly.slice(0, 2).join(","));
   check("the swell peaks before lock-out, not at closeness 1",
-        Math.max(...levels) > levels[4] && levels[1] >= levels[0],
-        levels.join(","));
+        Math.max(...levels) > levels[4], levels.join(","));
+  // What the ear actually gets: flat enough that the far end of a sweep is not the inaudible
+  // part. Measured against the real IRs in test_hrir_loudness.js; here we only check that the
+  // correction is wired in at all and pulls in the right direction.
+  // Guard the call site, not just the function: deleting the correction from updateVoice must
+  // fail a *behavioural* assertion, not only a regex on the source. If the tilt were dropped,
+  // the requested gain would follow the swell and rise with closeness; with it in place the
+  // far/low end asks for more gain than the near/high end.
+  check("the tilt is actually applied to the level, so a far crosshair asks for more gain",
+        levels[0] > levels[1], `${levels[0].toFixed(4)} vs ${levels[1].toFixed(4)}`);
+  check("the correction boosts the low (far) end more than the high (near) end",
+        mod.tiltCompensation(constant("TONE_MIN_HZ")) >
+        mod.tiltCompensation(constant("TONE_MAX_HZ")),
+        `${mod.tiltCompensation(constant("TONE_MIN_HZ")).toFixed(2)} vs ` +
+        `${mod.tiltCompensation(constant("TONE_MAX_HZ")).toFixed(2)}`);
   check("ducks out through the middle rather than cutting",
         levels[2] > 0 && levels[2] < levels[1] && levels[3] < levels[2],
         levels.slice(1).join(","));
@@ -430,9 +467,17 @@ console.log("\nA moving source crossfades between two convolvers (no IR switchin
         voice.convA.normalize === false && voice.convB.normalize === false);
   const firstIr = voice.irName;
   const firstActive = voice.activeConv;
-  check("one side is live and the other silent",
-        voice.gainA.gain.value + voice.gainB.gain.value === 1,
-        `A=${voice.gainA.gain.value} B=${voice.gainB.gain.value}`);
+  // The live side now carries this IR's own loudness compensation rather than a bare 1,
+  // because each IR needs a different amount (see test_hrir_loudness.js).
+  const startGain = mod.hrirGainFor(voice.irName, mod.hrir.buffers[voice.irName]);
+  // Which of A/B is live depends on how many swaps have happened, so ask the voice.
+  const liveGain = voice.activeConv === "A" ? voice.gainA : voice.gainB;
+  const idleGain = voice.activeConv === "A" ? voice.gainB : voice.gainA;
+  check("one side is live at that IR's gain and the other is silent",
+        Math.abs(liveGain.gain.value - startGain) < 1e-9 && idleGain.gain.value === 0,
+        `live=${liveGain.gain.value} idle=${idleGain.gain.value} expected ${startGain}`);
+  check("...and that gain is a real boost, not a pass-through", startGain > 2,
+        String(startGain));
 
   mod.advance(0.1);
   mod.syncTracking([entry(0, VW - 100, VH / 2, 0.5)], VW, VH);   // sweep to hard right
@@ -447,9 +492,13 @@ console.log("\nA moving source crossfades between two convolvers (no IR switchin
   const fade = constant("TONE_FADE_MS") / 1000;
   check("the crossfade is short but audible-safe (SonicSquid uses 0.05-0.1s)",
         fade >= 0.04 && fade <= 0.12, fade + "s");
-  const target = ramps.map((e) => e[1]).sort();
-  check("one side ramps to 0 and the other to 1", target[0] === 0 && target[target.length - 1] === 1,
-        JSON.stringify(target));
+  // The incoming side must ramp to the NEW IR's gain. Ramping to 1 (or to the old IR's
+  // gain) would step the loudness in the middle of the crossfade.
+  const wantedGain = mod.hrirGainFor(voice.irName, mod.hrir.buffers[voice.irName]);
+  const target = ramps.map((e) => e[1]).sort((a, b) => a - b);
+  check("one side ramps to silence and the other up to the new IR's gain",
+        target[0] === 0 && Math.abs(target[target.length - 1] - wantedGain) < 1e-9,
+        JSON.stringify(target) + " expected top " + wantedGain);
   check("no new convolver nodes are built while moving",
         mod.nodes().filter((n) => n.kind === "convolver").length === 2,
         String(mod.nodes().filter((n) => n.kind === "convolver").length));

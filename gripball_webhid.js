@@ -1172,9 +1172,38 @@
     // this project's own assets/hrir/, which unlike SonicSquid's 72-azimuth set also has
     // elevation. Falls back to PannerNode if the IRs can't be loaded.
     const HRIR_DIR = "assets/hrir/";
-    // Convolving a mono source with a stereo IR loses the ~6dB you'd get from a panner's
-    // own gain staging; measured against the PannerNode path to match loudness.
-    const HRIR_BOOST = 1.8;
+    // Convolution scales the signal by the IR's own energy, and these IRs are stored very
+    // quietly: their L2 norms run 0.055..0.130 in the front arc (-25..-18 dB), and 0.034 at
+    // the very back. A single fixed boost therefore cannot match loudness - it was 1.8,
+    // which implicitly assumes a norm of 0.556, so the convolver path came out ~13 dB below
+    // the PannerNode path and swung 7.5 dB depending purely on which direction was selected.
+    // That is inaudible for a quiet continuous source such as the aim tone.
+    //
+    // So divide by each IR's measured norm and apply one constant on top. HRIR_MATCH was
+    // solved by rendering both paths offline with the same source and matching RMS, which
+    // holds within about +-1 dB across the whole front arc. Dividing by the norm scales both
+    // channels by the same number, so the measured ILD - the whole point of normalize=false
+    // - is preserved exactly.
+    const HRIR_MATCH = 0.93;
+    // Guards against a pathological IR (an all-but-silent file would otherwise ask for an
+    // enormous gain). Nothing in the shipped dataset comes near this.
+    const HRIR_MIN_NORM = 0.02;
+    const hrirNorms = {};   // filename -> L2 norm, computed once per decoded buffer
+
+    function hrirGainFor(name, buffer) {
+      if (!buffer) return HRIR_MATCH;
+      let norm = hrirNorms[name];
+      if (norm == null) {
+        let sum = 0;
+        for (let ch = 0; ch < buffer.numberOfChannels; ch += 1) {
+          const data = buffer.getChannelData(ch);
+          for (let i = 0; i < data.length; i += 1) sum += data[i] * data[i];
+        }
+        norm = Math.sqrt(sum);
+        hrirNorms[name] = norm;
+      }
+      return HRIR_MATCH / Math.max(norm, HRIR_MIN_NORM);
+    }
     const hrir = {
       ready: false,
       failed: false,
@@ -1419,7 +1448,7 @@
     // Real-HRIR path. These are one-shot sounds, so a single convolver per sound is
     // enough - the A/B crossfade SonicSquid needs is only for a continuously sounding
     // source that moves between angles mid-playback.
-    function connectHrir(source, vector, options, irBuffer) {
+    function connectHrir(source, vector, options, irBuffer, irName) {
       const context = getContext();
       const airFilter = makeAirFilter(context, vector);
       const convolver = context.createConvolver();
@@ -1433,7 +1462,7 @@
       // in by hand, matching the PannerNode path's refDistance 1 / rolloff 0.45.
       const distance = 1 + Math.min(1.8, vector.dist * 0.7);
       const rolloff = 1 / (1 + 0.45 * (distance - 1));
-      gain.gain.value = (options.gain || 0.88) * HRIR_BOOST * rolloff;
+      gain.gain.value = (options.gain || 0.88) * hrirGainFor(irName, irBuffer) * rolloff;
       envelope.gain.value = 1;
       source.connect(envelope);
       envelope.connect(airFilter);
@@ -1451,7 +1480,7 @@
         const name = hrirNameFor(vector);
         if (name) {
           const buffer = hrir.buffers[name];
-          if (buffer) return connectHrir(source, vector, options, buffer);
+          if (buffer) return connectHrir(source, vector, options, buffer, name);
           loadHrirBuffer(name);
         }
       }
@@ -1502,7 +1531,19 @@
     // ---------------------------------------------------------------------------------
     const TONE_MIN_HZ = 196;          // G3 when the crosshair is nowhere near the duck
     const TONE_MAX_HZ = 784;          // G5 when it is right on top of it
-    const TONE_PEAK_GAIN = 0.16;      // deliberately well under the game's own sounds
+    // Measured in Chrome against the real graph, not chosen by eye. Two things had to be
+    // separated here: the convolver's *loudness* compensation (see hrirGainFor - that one is
+    // exact) and the fact that a narrowband source loses far more to an HRIR than a
+    // broadband one. These IRs are 256 taps at 48kHz = 5.3ms, which is barely one period at
+    // 200Hz, so they carry little low-frequency gain: convolving this tone delivers only
+    // 0.073..0.258 of the requested amplitude (median 0.116, i.e. -19dB) across the sweep and
+    // the screen. A quack is broadband and loses almost none of it. So the old 0.16 - picked
+    // by comparing dry amplitudes - shipped a tone that peaked at 0.033 against the quack's
+    // 0.360: 21dB down, which is simply not audible over a game. Retuned by measurement
+    // again after TONE_TILT_DB_PER_OCT below flattened the sweep (which by itself made the
+    // tone nearly as loud as a quack): this lands the delivered peak around -10..-15dB
+    // relative to the quack - clearly present, still plainly a background cue.
+    const TONE_PEAK_GAIN = 0.24;      // still deliberately under the game's own sounds
     const TONE_FADE_MS = 90;          // in/out, and the IR handover
     const TONE_GLIDE_MS = 70;         // pitch/volume smoothing between updates
     // The tone drops out once the crosshair is on the duck. Aiming is then a movement
@@ -1521,6 +1562,20 @@
     const TONE_LOCK_START = 0.82;     // starts ducking out here (~41px from the duck)
     const TONE_LOCK_SILENT = 0.90;    // fully silent by here (~23px), i.e. at the hitbox
     const TONE_LOCK_MS = 55;          // fast enough to feel like an event, not a click
+    // These IRs are 256 taps at 48kHz - 5.3ms, which is about one period at 190Hz - so they
+    // carry very little low-frequency energy. Measured over the front arc, the delivered
+    // level of a narrowband source tilts +8.2dB per octave (196Hz: -26dB, 784Hz: -9dB).
+    // For this tone that lands in the worst possible place: the low pitch means "far from the
+    // duck", so the start of every sweep - the part that has to catch your attention - is
+    // ~16dB quieter than the end, and the swell below was making it worse rather than better.
+    // So pre-tilt the level by the inverse. This is a property of the IR length, not of the
+    // synth, hence the correction lives here and not in the timbres.
+    const TONE_TILT_DB_PER_OCT = 8.2;
+    const TONE_TILT_REF_HZ = 784;     // full level at the top; correction only ever boosts
+    function tiltCompensation(hz) {
+      const octaves = Math.log2(Math.max(1, TONE_TILT_REF_HZ) / Math.max(1, hz));
+      return Math.pow(10, (TONE_TILT_DB_PER_OCT * octaves) / 20);
+    }
     // FM timbres, one per player. Each is a (harmonicity ratio, modulation index) pair -
     // the two numbers that decide an FM voice's character. Party Mode players need to tell
     // their own tone apart from everyone else's while all of them sweep the same pitch
@@ -1598,18 +1653,17 @@
         voice.convB.buffer = startingBuffer;
         voice.gainA = context.createGain();
         voice.gainB = context.createGain();
-        voice.gainA.gain.value = 1;
+        // The per-IR compensation lives on these two, because it changes with every IR swap
+        // and has to move as part of the crossfade. A/B start matched to the first IR.
+        voice.gainA.gain.value = hrirGainFor(startingIr, startingBuffer);
         voice.gainB.gain.value = 0;
         voice.irName = startingIr;
-        const boost = context.createGain();
-        boost.gain.value = HRIR_BOOST;
         airFilter.connect(voice.convA);
         airFilter.connect(voice.convB);
         voice.convA.connect(voice.gainA);
         voice.convB.connect(voice.gainB);
-        voice.gainA.connect(boost);
-        voice.gainB.connect(boost);
-        boost.connect(master);
+        voice.gainA.connect(master);
+        voice.gainB.connect(master);
       } else {
         voice.panner = context.createPanner();
         voice.panner.panningModel = "HRTF";
@@ -1658,8 +1712,12 @@
         param.cancelScheduledValues(now);
         param.setValueAtTime(param.value, now);
       }
+      // Each IR needs its own compensation, and they differ by up to 7.5dB across the front
+      // arc, so the incoming side fades up to ITS gain rather than to 1. Ramping the two
+      // sides against each other is also what keeps the swap inaudible - stepping the shared
+      // boost node instead would put a level jump in the middle of the crossfade.
       activeGain.gain.linearRampToValueAtTime(0, now + fade);
-      idleGain.gain.linearRampToValueAtTime(1, now + fade);
+      idleGain.gain.linearRampToValueAtTime(hrirGainFor(wanted, buffer), now + fade);
       voice.activeConv = voice.activeConv === "A" ? "B" : "A";
       voice.irName = wanted;
     }
@@ -1707,8 +1765,11 @@
       // lock-on. The lock-out uses its own short time constant: the swell wants to be
       // smooth, but the disappearance wants to be noticeable.
       const lock = lockEnvelope(closeness, locked);
+      // Only the convolver path has the low-frequency shortfall; the PannerNode fallback is
+      // roughly flat, so compensating there would make a far-away crosshair 16dB too loud.
+      const tilt = voice.panner ? 1 : tiltCompensation(hz);
       const level =
-        TONE_PEAK_GAIN * (0.55 + 0.45 * closeness) * (share == null ? 1 : share) * lock;
+        TONE_PEAK_GAIN * tilt * (0.55 + 0.45 * closeness) * (share == null ? 1 : share) * lock;
       voice.tone.gain.setTargetAtTime(
         level, now, lock < 1 ? TONE_LOCK_MS / 1000 : glide
       );
@@ -1829,8 +1890,45 @@
       return {state: context.state, sampleRate: context.sampleRate};
     }
 
+    // A real measurement of what is reaching the destination. Every scheduled-parameter
+    // readout can look perfect while the output is silent - a suspended context, a listener
+    // pinned somewhere odd, a convolver with an empty buffer, an output device that is not
+    // the one being listened to. Only sampling the signal distinguishes those.
+    let meter = null;
+    function measureOutput() {
+      const context = getContext();
+      if (!meter) {
+        meter = context.createAnalyser();
+        meter.fftSize = 2048;
+        // Taps master without consuming it: an AnalyserNode passes audio through, and
+        // nothing is connected to its output, so this does not alter what is heard.
+        master.connect(meter);
+        meter.buffer = new Float32Array(meter.fftSize);
+      }
+      meter.getFloatTimeDomainData(meter.buffer);
+      let peak = 0;
+      let sum = 0;
+      for (let i = 0; i < meter.buffer.length; i += 1) {
+        const s = meter.buffer[i];
+        const a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+        sum += s * s;
+      }
+      const rms = Math.sqrt(sum / meter.buffer.length);
+      return {
+        state: context.state,
+        peak, rms,
+        db: rms > 0 ? 20 * Math.log10(rms) : -Infinity,
+        masterGain: master ? master.gain.value : null,
+        destination: context.destination ? context.destination.channelCount : null,
+        sinkId: typeof context.sinkId === "string" ? context.sinkId : "(default)",
+        sharedWithGodot: Boolean(window.GodotAudio && window.GodotAudio.ctx === context),
+        voices: voices.size,
+      };
+    }
+
     window.duckHuntSpatialAudio = {
-      play, syncTracking, stopAllTracking, debugVoice, resumeAudio,
+      play, syncTracking, stopAllTracking, debugVoice, resumeAudio, measureOutput,
     };
 
     // Needs a live AudioContext to decode into, so it can only run after a user gesture.

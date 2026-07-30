@@ -29,15 +29,20 @@ const pieces = [
   grab(/function sourceVector\(x, y, vw, vh\) \{[\s\S]*?\n    \}/, "sourceVector"),
   grab(/function makeAirFilter\(context, vector\) \{[\s\S]*?\n    \}/, "makeAirFilter"),
   grab(/function connectHrtf\(source, vector, options\) \{[\s\S]*?\n    \}/, "connectHrtf"),
-  grab(/function connectHrir\(source, vector, options, irBuffer\) \{[\s\S]*?\n    \}/, "connectHrir"),
+  grab(/function connectHrir\(source, vector, options, irBuffer, irName\) \{[\s\S]*?\n    \}/, "connectHrir"),
+  // Per-IR loudness compensation; test_hrir_loudness.js covers the arithmetic itself.
+  grab(/function hrirGainFor\(name, buffer\) \{[\s\S]*?\n    \}/, "hrirGainFor"),
   grab(/function spatialize\(source, vector, options\) \{[\s\S]*?\n    \}/, "spatialize"),
 ];
-const HRIR_BOOST = Number(grab(/const HRIR_BOOST = ([\d.]+);/, "HRIR_BOOST").match(/[\d.]+/)[0]);
+const HRIR_MATCH = Number(grab(/const HRIR_MATCH = ([\d.]+);/, "HRIR_MATCH").match(/[\d.]+/)[0]);
+const HRIR_MIN_NORM = Number(grab(/const HRIR_MIN_NORM = ([\d.]+);/, "HRIR_MIN_NORM").match(/[\d.]+/)[0]);
 
 // Stub Web Audio: every node records its type and outgoing connections so we can walk the
 // graph the code actually built.
 const harness = `
-  const HRIR_BOOST = ${HRIR_BOOST};
+  const HRIR_MATCH = ${HRIR_MATCH};
+  const HRIR_MIN_NORM = ${HRIR_MIN_NORM};
+  const hrirNorms = {};
   let nodes = [];
   let fetched = [];
   const master = {kind: "master", outputs: []};
@@ -68,7 +73,7 @@ const harness = `
   ${pieces.join("\n")}
   return {
     hrir, spatialize, sourceVector,
-    reset() { nodes = []; fetched = []; },
+    reset() { nodes = []; fetched = []; for (const k of Object.keys(hrirNorms)) delete hrirNorms[k]; },
     nodes: () => nodes,
     fetched: () => fetched,
     master,
@@ -209,17 +214,35 @@ console.log("\nLoudness is matched between the two paths so the fallback is not 
   mod.reset();
   mod.spatialize(mod.newSource(), vector, {gain: 0.9});
   const irName = mod.fetched()[0];
-  mod.hrir.buffers[irName] = {label: irName, length: 256};
+  // A stub IR with real samples, scaled to a norm typical of the shipped dataset (~0.08).
+  // The old version of this test used a buffer with no samples at all, which is precisely why
+  // it could not notice that the compensation was ~13dB short: with nothing to measure, any
+  // constant looked as good as any other.
+  const NORM = 0.08;
+  const taps = new Float32Array(256);
+  taps[0] = NORM;                       // one impulse, so the L2 norm is exactly NORM
+  mod.hrir.buffers[irName] = {
+    label: irName, length: 256, numberOfChannels: 1, getChannelData: () => taps,
+  };
 
   mod.reset();
   mod.spatialize(mod.newSource(), vector, {gain: 0.9});
   const hrirGain = mod.nodes().filter((n) => n.kind === "gain").map((n) => n.gain.value)
     .find((v) => v !== 1);
 
-  check("convolver path applies the loudness-compensation boost",
-        hrirGain > 0.9 && hrirGain < 0.9 * HRIR_BOOST * 1.01,
-        `gain=${hrirGain} (0.9 * ${HRIR_BOOST} * rolloff)`);
-  check("convolver path gain is finite and not clipping-hot", hrirGain > 0 && hrirGain <= 2,
+  // Convolving by an IR of norm N multiplies the signal by roughly N, so the compensation
+  // has to be proportional to 1/N. Anything that ignores N - any fixed constant - fails.
+  const expected = 0.9 * (HRIR_MATCH / NORM);
+  check("the convolver path compensates for the IR's own quietness",
+        hrirGain > expected * 0.5 && hrirGain <= expected * 1.01,
+        `gain=${hrirGain}, expected ~${expected.toFixed(2)} before rolloff`);
+  check("...so the level after convolution lands near unity, not tens of dB down",
+        Math.abs(20 * Math.log10(hrirGain * NORM / 0.9)) < 6,
+        `${(20 * Math.log10(hrirGain * NORM / 0.9)).toFixed(1)}dB relative to the dry source`);
+  // The gain is legitimately ~10x now, so the old "<= 2" ceiling would be wrong. Bound it by
+  // what the quietest allowed IR can ask for instead.
+  check("gain stays bounded even for a pathologically quiet IR",
+        hrirGain > 0 && hrirGain <= 0.9 * (HRIR_MATCH / HRIR_MIN_NORM),
         String(hrirGain));
 }
 

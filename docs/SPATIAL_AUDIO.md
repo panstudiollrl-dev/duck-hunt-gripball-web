@@ -162,10 +162,78 @@ IR 檔不預載全部（344 個，即使只有 707KB 也沒必要）：
 
 ## 增益補償
 
-Convolution 之後普遍偏小聲（`HRIR_BOOST = 1.8`），而且 convolver 自己沒有距離衰減
-模型，所以照 PannerNode 那條路的參數（refDistance 1 / rolloff 0.45）手算一份
-inverse rolloff 補上，兩條路的音量才不會在退回時忽大忽小。
-`tools/test_spatial_graph.js` 有驗這件事。
+這一節踩過兩個**不同**的坑，兩個都會讓聲音小到聽不見，但原因完全不一樣。分開講。
+
+### 一、每個 IR 自己的音量（方向造成的）
+
+Convolution 會把訊號乘上 **IR 自己的能量**。這批實測 IR 存得很小聲：L2 norm 在正面弧
+是 0.055~0.130（−25~−18dB），最背面只有 0.034，整個資料集跨 11.9dB。所以
+「一個固定倍數」根本不可能對 —— 原本寫死 `HRIR_BOOST = 1.8`，等於假設 norm 是 0.556，
+比實際大了 13~20dB，於是 convolver 那條路比 PannerNode 那條路小了約 13dB，而且**光是換
+方向就會晃 7.5dB**。
+
+現在改成每個 IR 各算一次：
+
+```
+hrirGainFor(name, buffer) = HRIR_MATCH / max(該 IR 的 L2 norm, HRIR_MIN_NORM)
+```
+
+`HRIR_MATCH = 0.93` 是拿 offline render 對著 PannerNode 那條路解出來的。左右耳**除以
+同一個數**，所以 ILD（`normalize = false` 要保護的東西）原封不動 —— 這是重點，正規化
+會把雙耳音量差抹平，我們要的是補音量、不是抹線索。
+
+補償掛在 A/B 兩個 gain 上，不是掛在後面共用的節點上：IR 一換就得跟著 crossfade 一起
+移動，不然每次換方向都會在淡化中間出現一個音量階。
+實測結果：方向造成的音量差 7.5dB → **2.7dB**，跟 PannerNode 那條路最多差 1.7dB。
+
+convolver 自己沒有距離衰減模型，所以另外照 PannerNode 的參數
+（refDistance 1 / rolloff 0.45）手算一份 inverse rolloff 補上。
+
+### 二、窄頻訊號被 IR 的低頻不足吃掉（頻率造成的）
+
+上面那件事修好之後**準心音還是幾乎聽不到**，這是第二個坑，跟方向無關。
+
+IR 只有 **256 taps / 48kHz = 5.3ms**，大約是 190Hz 的一個週期，所以它**帶不動低頻**。
+一次性音效（quack 等）是寬頻的，能量攤在整個頻譜上，幾乎不受影響；準心音是**窄頻**的
+FM 音，只取樣 |H(f)| 上的一個點，於是照著 IR 的頻率響應被削。實測正面弧的中位數：
+
+| carrier | 送出去 1.0 實際到達 | |
+|---|---|---|
+| 196Hz（離鴨子最遠） | 0.049 | −26.1dB |
+| 294Hz | 0.096 | −20.3dB |
+| 440Hz | 0.173 | −15.2dB |
+| 784Hz（對到鴨子） | 0.350 | −9.1dB |
+
+也就是 **+8.2dB/octave 的斜率**，整段掃音兩端差 16dB。而且方向剛好最壞：低音代表
+「離鴨子還很遠」，也就是這個提示**最需要被聽到**的時候最小聲；原本的 swell
+（`0.55 + 0.45 × closeness`）越靠近越大聲，是在**加重**這個斜率而不是抵銷它。
+
+所以 `tiltCompensation(hz)` 按 `TONE_TILT_DB_PER_OCT = 8.2` 反向預補，以 784Hz 為基準
+（只會往上補、不會往下砍）。**只補 convolver 那條路** —— PannerNode 是平的，補了會讓
+遠處的準心大 16dB。
+
+### 三、於是 `TONE_PEAK_GAIN` 是量出來的，不是挑的
+
+原本 0.16 是拿**乾訊號**的振幅跟其他音效比出來的，忽略了上面那 19dB 中位數的損失，
+實際送到喇叭是 **peak 0.033、比 quack 的 0.360 小 21dB** —— 這就是「完全無聲」的真相。
+斜率補平之後又反而太大聲（0.31，快跟 quack 一樣），最後定在 **0.24**。
+
+真實 Chrome 量到的結果（`AnalyserNode` 掛在 master 上，不是讀 AudioParam）：
+
+| | peak | 相對 quack |
+|---|---|---|
+| 修之前 | 0.0025 → 0.033 | −21dB（聽不到） |
+| 現在 | 0.116 ~ 0.147 | **−8dB** |
+
+而且整段掃音變平了（−16 ~ −15dBFS，原本 −31 ~ −18dB），所以掃音的開頭不再是聽不到的
+那一段。
+
+**這裡真正的教訓是：stub 測試結構上抓不到「沒聲音」。** 它記的是排程到 AudioParam 上的
+數值，gain 讀起來 0.14 一切正常，而 convolver 出來的音訊已經低了 50dB。所以現在多了
+`tools/test_hrir_loudness.js`：直接讀真的 WAV、抓真的函式，斷言
+`norm × gain ≈ 定值`（方向）以及補償後掃音夠平（頻率）。絕對音量那一項刻意**不**由它
+斷言 —— 它只算 carrier，FM 的 sideband 落在 IR 較強的高頻，所以它比實際低約 12dB；
+絕對值是瀏覽器量的。
 
 ## 測試
 
@@ -174,7 +242,11 @@ node tools/test_source_vector.js   # 螢幕座標 → lateral/vertical（含 let
 node tools/test_hrir_mapping.js    # 角度挑選正確性，真值來自 IR 實測 ITD/ILD
 node tools/test_spatial_graph.js   # 節點圖、退回路徑、距離濾波、增益匹配
 node tools/test_tracking_tone.js   # 追蹤音：音高、lock 靜音、FM 音色、A/B crossfade
+node tools/test_hrir_loudness.js   # 讀真 WAV：每個 IR 的增益補償、窄頻斜率補償
 ```
+
+`test_hrir_loudness.js` 刻意**不依賴任何 npm 套件**（自己寫了一個極小的 float32 WAV
+reader 和單點 DFT），所以整組測試不需要 `node_modules` 就能跑。
 
 `test_tracking_tone.js` 是把 `gripball_webhid.js` 裡的真函式抓出來、餵給一組假的
 Web Audio node（每個 AudioParam 都記下所有排程事件，所以 ramp 可以被檢查）。它也用
@@ -188,13 +260,17 @@ regex 檢查 `gripball_input.gd.reference` 送出的欄位、並重建 GDScript 
 
 ## 還沒做
 
-- **追蹤音沒有在真的瀏覽器裡聽過**。上面所有的音色／時間常數都是照 FM 的數學和聽覺
-  推論挑的，不是調出來的。特別要現場確認的：`TONE_PEAK_GAIN = 0.16` 會不會蓋掉 quack、
-  55ms 的收尾會不會反而聽起來像爆音、P3 的非整數比在低音端會不會太吵、以及一段掃音
-  （按壓到抵達，大約 0.3~0.6 秒）夠不夠長到聽得出空間感的移動。
+- **追蹤音的「音量」已經在真的 Chrome 裡量過了，但「好不好聽」還沒有人耳聽過。**
+  量過的是：一次按壓真的會發聲、對到鴨子真的會停、放開之後 voice 真的被丟掉
+  （release 之後 rms 歸零）、以及相對 quack 是 −8dB。**還沒有人耳確認的**是那些
+  照 FM 數學挑出來、不是調出來的常數：55ms 的收尾會不會聽起來像爆音、P3 的非整數比在
+  低音端會不會太吵、四個人同時發聲會不會糊掉。
   要單獨聽不用開遊戲：`tone_bench.html` 直接載入真的 `syncTracking()`，在框裡按住滑鼠
   就是一次按壓（準心會自己被拉向鴨子，跟遊戲一樣）。取消「一按一段」會變回持續發聲、
   lock 半徑拉到 0 則完全不靜音，方便單獨聽音高和空間感。
+  bench 上的「實測輸出（RMS）」是 `AnalyserNode` 從 master 抓的真實訊號，
+  不是讀回 AudioParam —— **要判斷「有沒有聲音」只能看這一欄**，「音量」那一欄是送進去的
+  請求值，它正常但完全無聲是真的會發生的（見上面的增益補償）。
 - **瀏覽器的 AudioContext 一定要在使用者手勢裡面 resume**。`getContext()` 裡那個
   `ctx.resume()` 是 fire-and-forget 的，在 `requestAnimationFrame` 裡才第一次發聲的話
   Chrome 會讓 context 一直停在 suspended —— 整個 graph 照跑、`debugVoice()` 回報的

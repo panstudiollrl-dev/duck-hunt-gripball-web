@@ -3,3 +3,8 @@ tools/__pycache__/
 # 1551 個 MeshRIR HRIR wav：改成 Web Audio HRTF PannerNode 之後就沒用到了，
 # 留在工作目錄方便日後比對，不進 repo（6MB）。
 hrir_wavs/
+
+# 只有「在真瀏覽器裡量音量」用得到的工具：playwright-core（開真的 Chrome）和
+# node-web-audio-api（offline render）。都是 --no-save 裝的、沒有 package.json，
+# 因為六組測試刻意寫成不需要它們就能跑（test_hrir_loudness.js 自己讀 WAV）。
+node_modules/

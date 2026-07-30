@@ -63,6 +63,34 @@
   // press check on residual alone.
   const CALIBRATION_PRESS_RATIO = 0.8;
 
+  // ---------------------------------------------------------------------------------
+  // No-calibration path (Pan, 2026-07-30)
+  //
+  // Calibration is skipped entirely: pressing past a fixed number of counts above the
+  // baseline counts as "on". The whole three-round sequence existed only to learn each
+  // ball's own range, and it cost ~20s per player and could still stall on sensor creep.
+  //
+  // KNOWN RISK, raised with Pan and kept at their decision: the one ball measured so far
+  // produces about 1400 counts at a full squeeze (see tools/test_calibration_release.js,
+  // MAGNITUDE = 1400), so a bar of 3000 is above what that ball can reach and it will never
+  // turn on. If that happens in play the fix is this number alone - lower it, nothing else
+  // has to change. QUICK_ENGAGE_FORCE is also exposed in the tuning panel as 追蹤啟動, so it
+  // can be changed live without a rebuild.
+  const QUICK_ENGAGE_FORCE = 3000;
+  // Hysteresis, so a reading hovering at the bar does not chatter on and off. Held at a
+  // fraction rather than a second constant: whatever the bar is retuned to, the release
+  // bar follows it and cannot accidentally end up above it.
+  const QUICK_RELEASE_RATIO = 0.5;
+  // The baseline still has to come from somewhere - it is the sensor's own zero and differs
+  // per ball, so it cannot be a constant. This is a quiet sample taken while the player is
+  // just holding the ball, with no instruction and no pass/fail: whatever arrives is taken as
+  // rest. autoZeroDown()/the play-phase auto-zero keep correcting it afterwards, which is
+  // what makes a rough first estimate good enough.
+  const QUICK_BASELINE_MS = 700;
+  // If no readings arrive at all we cannot invent a zero. The ball sleeps until squeezed, so
+  // this waits for the stream rather than failing outright.
+  const QUICK_WAKE_MS = 12000;
+
   const SHAKE_REST_MS = 900;
   const SHAKE_SAMPLE_MS = 2500;
   const SHAKE_FIRE_RATIO = 0.45;
@@ -78,21 +106,32 @@
     KeyL: {player: 1, action: "shoot"},
   };
 
-  const TUNING_KEY = "gripball-tuning-v2";
+  // Bumped from v2 with the fixed-threshold change. Anyone who has played before has an
+  // engageForce of ~60 saved in localStorage, and loadTuning() marks that as touched - which
+  // would silently override the new default and make the change look like it did nothing.
+  // A new key discards those stale values once.
+  const TUNING_KEY = "gripball-tuning-v3";
   const HUD_KEY = "gripball-hud-hidden";
   const TUNING_DEFAULTS = {
-    engageForce: 60,
-    releaseForce: 25,
-    fullForce: 400,
+    // No calibration means these are no longer derived per ball; they are the fixed bars.
+    // See QUICK_ENGAGE_FORCE for why this number and how to change it.
+    engageForce: QUICK_ENGAGE_FORCE,
+    releaseForce: Math.round(QUICK_ENGAGE_FORCE * QUICK_RELEASE_RATIO),
+    // Has to sit above the engage bar, or tracking would already be at full speed the instant
+    // it turns on and the pressure would stop meaning anything. Calibration used to derive
+    // this per ball (travel); with a fixed engage bar it is a fixed multiple of it.
+    fullForce: Math.round(QUICK_ENGAGE_FORCE * 1.5),
     fireAccel: 26,
     cooldownMs: 1150,
     hapticPower: 95,
     hapticMs: 90,
   };
+  // Ranges have to reach the new bars: the old max of 900 could not even express the default
+  // 3000, so the slider would have silently clamped the value it displayed.
   const TUNING_FIELDS = [
-    {key: "engageForce", label: "追蹤啟動", unit: "力", min: 5, max: 900, step: 5},
-    {key: "releaseForce", label: "追蹤放開", unit: "力", min: 2, max: 900, step: 5},
-    {key: "fullForce", label: "追蹤全速", unit: "力", min: 40, max: 4000, step: 20},
+    {key: "engageForce", label: "追蹤啟動", unit: "力", min: 5, max: 8000, step: 5},
+    {key: "releaseForce", label: "追蹤放開", unit: "力", min: 2, max: 8000, step: 5},
+    {key: "fullForce", label: "追蹤全速", unit: "力", min: 40, max: 12000, step: 20},
     {key: "fireAccel", label: "甩動開槍", unit: "甩", min: 10, max: 90, step: 0.5},
     {key: "cooldownMs", label: "開槍冷卻", unit: "ms", min: 200, max: 2000, step: 50},
     {key: "hapticPower", label: "震動強度", unit: "", min: 10, max: 100, step: 5},
@@ -321,7 +360,18 @@
       }
     }
 
-    if (state.phase === "play" && !player.holding) {
+    // Drift the baseline towards a resting reading, to walk off sensor creep and the error in
+    // the rough start-up baseline.
+    //
+    // Only while the reading is genuinely near rest, though. This used to run for any reading
+    // below the engage bar, which meant the baseline chased the player's hand on the way up:
+    // every sample spent below the bar pulled rest upwards, so the bar effectively retreated
+    // as it was approached. With the old bar of 60 that was invisible (it was crossed within a
+    // sample or two), but at a bar of thousands it is not - a slow squeeze towards a bar of
+    // 3000 has to actually reach ~4000 counts, and a slower one more still. Rest is a small
+    // fraction of the bar, so anything above that is a press in progress, not new rest.
+    const restBand = Math.max(20, engageForce * 0.15);
+    if (state.phase === "play" && !player.holding && force < restBand) {
       player.baseline = player.baseline * 0.995 + grip * 0.005;
     }
     const rawStrength = Math.max(0, Math.min(1, force / Math.max(tuning.fullForce, 20)));
@@ -388,11 +438,15 @@
 
   function refreshUi() {
     const startButton = document.getElementById("gripball-start");
-    if (startButton) startButton.disabled = state.players.length < 1 || state.phase !== "connect" || state.keyboardMode;
+    const calibrateButton = document.getElementById("gripball-calibrate");
+    const ready = state.players.length >= 1 && state.phase === "connect" && !state.keyboardMode;
+    if (startButton) startButton.disabled = !ready;
+    if (calibrateButton) calibrateButton.disabled = !ready;
     const connectButton = document.getElementById("gripball-connect");
     const keyboardButton = document.getElementById("gripball-keyboard");
     if (connectButton) connectButton.style.display = state.phase === "connect" ? "" : "none";
     if (startButton) startButton.style.display = state.phase === "connect" ? "" : "none";
+    if (calibrateButton) calibrateButton.style.display = state.phase === "connect" ? "" : "none";
     if (keyboardButton) keyboardButton.style.display = state.phase === "connect" ? "" : "none";
   }
 
@@ -932,6 +986,69 @@
     await sleep(300);
   }
 
+  /**
+   * The no-calibration start: take a rough zero and go.
+   *
+   * Deliberately has no pass/fail and no retry. Everything calibration used to derive is
+   * either a fixed constant now (the engage/release bars) or falls back to TUNING_DEFAULTS
+   * (fullForce, fireAccel), and both are reachable in the tuning panel if a ball needs
+   * different numbers. The one thing that genuinely cannot be a constant is the baseline,
+   * since it is each sensor's own zero - so that is all this measures.
+   *
+   * Never throws for a bad reading: a rough baseline is corrected continuously in play by
+   * autoZeroDown() and the play-phase drift in estimateGrip(). Only a total absence of
+   * readings is reported, because there is no zero to guess from at all.
+   */
+  async function quickStartPlayer(player) {
+    const start = performance.now();
+    let lastUi = 0;
+    // The ball sleeps until it is touched, so wait for the stream rather than failing.
+    while (!gripIsLive(player)) {
+      if (performance.now() - start > QUICK_WAKE_MS) {
+        throw new Error(`P${player.playerId + 1} 收不到壓力資料，請按一下球喚醒它`);
+      }
+      if (performance.now() - lastUi > 90) {
+        emitCalibration(player, "PRESS BALL ONCE TO WAKE", 0);
+        lastUi = performance.now();
+      }
+      await sleep(25);
+    }
+
+    // Take the quiet sample. The median is deliberate: a mean would be dragged by a stray
+    // spike if the player fidgets, and this is the one number we cannot re-derive.
+    const samples = [];
+    const sampleStart = performance.now();
+    while (performance.now() - sampleStart < QUICK_BASELINE_MS) {
+      if (gripIsLive(player)) samples.push(player.grip);
+      if (performance.now() - lastUi > 90) {
+        emitCalibration(player, "HOLD BALL - DO NOT PRESS", 50);
+        lastUi = performance.now();
+      }
+      await sleep(20);
+    }
+    if (!samples.length) {
+      throw new Error(`P${player.playerId + 1} 收不到壓力資料，請按一下球喚醒它`);
+    }
+    player.baseline = median(samples);
+    // Left unmeasured on purpose: travel drives the 0..1 tracking scale, and the tuning
+    // default (fullForce 400) covers it. Same for the shake thresholds, which fall back to
+    // fireAccel. Both are live-adjustable if a ball turns out to need something else.
+    player.travel = tuning.fullForce;
+    player.peak = null;
+    player.tracking = -1;
+    player.holding = false;
+    emitCalibration(player, "READY", 100, player.baseline);
+  }
+
+  async function quickStartAllPlayers() {
+    state.phase = "calibrating";
+    refreshUi();
+    state.calibrationStarted = performance.now();
+    // All at once: nobody has to take turns when there is nothing to perform.
+    await Promise.all(state.players.map((player) => quickStartPlayer(player)));
+    refreshTuningUi();
+  }
+
   async function calibrateAllPlayers() {
     state.phase = "calibrating";
     refreshUi();
@@ -947,12 +1064,21 @@
     refreshTuningUi();
   }
 
-  async function startGame() {
+  /**
+   * @param {boolean} withCalibration Run the old three-round sequence. Default is not to:
+   *   a fixed threshold needs only a zero, so the normal path just takes one and starts.
+   */
+  async function startGame(withCalibration) {
     if (state.players.length < 1 || state.phase !== "connect") return;
     try {
       await resumeAudioAndFocusCanvas();
-      setStatus(`準備校正 ${state.players.length} 顆握力球…`, "waiting");
-      await calibrateAllPlayers();
+      if (withCalibration) {
+        setStatus(`準備校正 ${state.players.length} 顆握力球…`, "waiting");
+        await calibrateAllPlayers();
+      } else {
+        setStatus(`拿好 ${state.players.length} 顆握力球，先不要按…`, "waiting");
+        await quickStartAllPlayers();
+      }
       state.phase = "starting";
       setStatus(`正在標記 ${state.players.length} 顆握力球編號…`, "waiting");
       await identifyPlayers();
@@ -967,7 +1093,12 @@
     } catch (error) {
       console.error(error);
       state.phase = "connect";
-      setStatus(`校正失敗：${error.message || error}。請放開握力球後再開始。`, "error");
+      setStatus(
+        withCalibration
+          ? `校正失敗：${error.message || error}。請放開握力球後再開始。`
+          : `無法開始：${error.message || error}`,
+        "error"
+      );
     }
     refreshUi();
   }
@@ -1098,7 +1229,7 @@
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
-    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><button id="gripball-keyboard">鍵盤測試</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
+    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><button id="gripball-calibrate" disabled title="舊的三輪校正流程。固定門檻對這顆球不合用時才需要">重新校正</button><button id="gripball-keyboard">鍵盤測試</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
     document.body.appendChild(panel);
     const dot = document.createElement("button");
     dot.id = "gripball-show";
@@ -1118,7 +1249,12 @@
     }
 
     document.getElementById("gripball-connect").addEventListener("click", addDevices);
-    document.getElementById("gripball-start").addEventListener("click", startGame);
+    // Wrapped, not passed directly: a click handler receives the event, which is truthy, so
+    // handing startGame straight to addEventListener would run the old calibration every time.
+    document.getElementById("gripball-start")
+      .addEventListener("click", () => startGame(false));
+    document.getElementById("gripball-calibrate")
+      .addEventListener("click", () => startGame(true));
     document.getElementById("gripball-keyboard").addEventListener("click", startKeyboardTest);
     window.addEventListener("keydown", (event) => handleKeyboard(event, true));
     window.addEventListener("keyup", (event) => handleKeyboard(event, false));

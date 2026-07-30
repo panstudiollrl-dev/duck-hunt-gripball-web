@@ -1,0 +1,378 @@
+extends Node
+
+signal calibration_finished
+signal players_changed(count: int)
+signal player_shot(player_id: int)
+
+const PORT := 8001
+const FEEDBACK_PORT := 8002
+const TRACK_SPEED_MIN := 45.0
+const TRACK_SPEED_MAX := 300.0
+const PARTY_TRACK_SPEED_MIN := 55.0
+const PARTY_TRACK_SPEED_MAX := 255.0
+const PARTY_WOBBLE_MIN := 10.0
+const PARTY_WOBBLE_MAX := 42.0
+var udp := PacketPeerUDP.new()
+var feedback_udp := PacketPeerUDP.new()
+var virtual_position := Vector2.ZERO
+var crosshair: Sprite2D
+var crosshair_white: Texture2D
+var crosshair_red: Texture2D
+var tracking_strength := 0.0
+var calibration_complete := false
+var party_mode := false
+var player_count := 0
+var party_crosshairs := {}
+var party_positions := {}
+var party_strengths := {}
+var party_wobble_phase := {}
+var party_layer: CanvasLayer
+var status_label: Label
+var step_label: Label
+var progress_bar: ProgressBar
+var calibration_panel: ColorRect
+var value_label: Label
+var last_feedback_time := 0.0
+var web_mode := false
+
+
+func _ready() -> void:
+	# Keep the real OS cursor available for menus such as Continue. Gripball
+	# input uses its own Sprite2D crosshair and never moves the OS pointer.
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	virtual_position = get_viewport().get_visible_rect().size * 0.5
+	_create_crosshair()
+	_create_status_label()
+	web_mode = OS.has_feature("web")
+	if web_mode:
+		_setup_web_input()
+		return
+	var result = udp.bind(PORT, "127.0.0.1")
+	feedback_udp.set_dest_address("127.0.0.1", FEEDBACK_PORT)
+	if result == OK:
+		print("Gripball UDP input listening on 127.0.0.1:", PORT)
+	else:
+		push_error("Gripball UDP input could not bind: " + str(result))
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_IN:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	elif what == NOTIFICATION_APPLICATION_FOCUS_OUT:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+
+
+func _process(_delta: float) -> void:
+	if web_mode:
+		_poll_web_input()
+	while udp.get_available_packet_count() > 0:
+		var message = JSON.parse_string(udp.get_packet().get_string_from_utf8())
+		_handle_message(message)
+	_update_tracking(_delta)
+
+
+func _handle_message(message: Variant) -> void:
+	if not message is Dictionary:
+		return
+	if message.get("type") == "aim":
+		var viewport := get_viewport()
+		virtual_position += Vector2(
+			float(message.get("dx", 0.0)),
+			float(message.get("dy", 0.0))
+		)
+		virtual_position = virtual_position.clamp(
+			Vector2.ZERO,
+			viewport.get_visible_rect().size
+		)
+		crosshair.position = virtual_position
+	elif message.get("type") == "aim_abs":
+		var size := get_viewport().get_visible_rect().size
+		virtual_position = Vector2(
+			clampf(float(message.get("x", 0.5)), 0.0, 1.0) * size.x,
+			clampf(float(message.get("y", 0.5)), 0.0, 1.0) * size.y
+		)
+		crosshair.position = virtual_position
+	elif message.get("type") == "shoot":
+		_send_click(true)
+		_send_click(false)
+	elif message.get("type") == "player_count":
+		party_mode = true
+		var new_player_count := maxi(int(message.get("count", 1)), 1)
+		crosshair.hide()
+		if new_player_count != player_count or party_crosshairs.is_empty():
+			player_count = new_player_count
+			_setup_party_crosshairs(player_count)
+			players_changed.emit(player_count)
+	elif message.get("type") == "shoot_player":
+		party_mode = true
+		var player_id := maxi(int(message.get("player", 0)), 0)
+		player_shot.emit(player_id)
+		var scene := get_tree().current_scene
+		if scene and scene.has_method("_on_gripball_player_shot"):
+			scene._on_gripball_player_shot(player_id, party_positions.get(player_id, virtual_position))
+		else:
+			_send_click(true)
+			_send_click(false)
+	elif message.get("type") == "track_player":
+		party_mode = true
+		var track_player_id := maxi(int(message.get("player", 0)), 0)
+		var strength := clampf(float(message.get("value", 0.0)), 0.0, 1.0)
+		party_strengths[track_player_id] = strength
+		if party_crosshairs.has(track_player_id):
+			party_crosshairs[track_player_id].texture = crosshair_red if strength > 0.01 else crosshair_white
+	elif message.get("type") == "track_strength":
+		if party_mode:
+			return
+		tracking_strength = clampf(float(message.get("value", 0.0)), 0.0, 1.0)
+		crosshair.texture = crosshair_red if tracking_strength > 0.01 else crosshair_white
+	elif message.get("type") == "calibration":
+		status_label.text = str(message.get("text", "Calibrating..."))
+		step_label.text = str(message.get("step", "CALIBRATION"))
+		progress_bar.value = float(message.get("progress", 0.0))
+		value_label.text = "RAW %s   BASE %s   FORCE %s" % [
+			str(message.get("raw", "--")),
+			str(message.get("baseline", "--")),
+			str(message.get("force", "--")),
+		]
+		calibration_panel.show()
+	elif message.get("type") == "calibration_done":
+		calibration_panel.hide()
+		if not party_mode:
+			crosshair.show()
+		if not calibration_complete:
+			calibration_complete = true
+			calibration_finished.emit()
+
+
+func _setup_web_input() -> void:
+	var script := FileAccess.get_file_as_string("res://web/gripball_webhid.js")
+	if script.is_empty():
+		push_error("WebHID controller script is missing")
+		return
+	JavaScriptBridge.eval(script, true)
+
+
+func _poll_web_input() -> void:
+	var payload = JavaScriptBridge.eval(
+		"window.gripballBridge ? window.gripballBridge.poll() : '[]'", true
+	)
+	if not payload is String or payload.is_empty():
+		return
+	var messages = JSON.parse_string(payload)
+	if messages is Array:
+		for message in messages:
+			_handle_message(message)
+
+
+func _create_crosshair() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 1000
+	add_child(layer)
+	party_layer = CanvasLayer.new()
+	party_layer.layer = 1000
+	add_child(party_layer)
+	crosshair = Sprite2D.new()
+	crosshair_white = load("res://assets/cursors/crosshairs_white.png")
+	crosshair_red = load("res://assets/cursors/crosshairs_red.png")
+	crosshair.texture = crosshair_white
+	crosshair.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	crosshair.scale = Vector2(0.25, 0.25)
+	crosshair.position = virtual_position
+	crosshair.z_index = 1000
+	crosshair.hide()
+	layer.add_child(crosshair)
+
+
+func _setup_party_crosshairs(count: int) -> void:
+	if not party_layer:
+		return
+	for child in party_layer.get_children():
+		child.queue_free()
+	party_crosshairs.clear()
+	party_positions.clear()
+	party_strengths.clear()
+	party_wobble_phase.clear()
+	var size := get_viewport().get_visible_rect().size
+	for player_id in range(count):
+		var sprite := Sprite2D.new()
+		sprite.texture = crosshair_white
+		sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		sprite.scale = Vector2(0.20, 0.20)
+		sprite.z_index = 1000
+		var position := Vector2(
+			size.x * (float(player_id) + 0.5) / float(count),
+			size.y * 0.55
+		)
+		sprite.position = position
+		party_positions[player_id] = position
+		party_strengths[player_id] = 0.0
+		party_wobble_phase[player_id] = randf() * TAU
+		party_layer.add_child(sprite)
+		party_crosshairs[player_id] = sprite
+		var label := Label.new()
+		label.text = str(player_id + 1)
+		label.position = Vector2(-8, -28)
+		label.size = Vector2(16, 12)
+		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		label.add_theme_font_size_override("font_size", 9)
+		label.add_theme_color_override("font_color", Color(1.0, 0.75, 0.12))
+		label.add_theme_color_override("font_outline_color", Color.BLACK)
+		label.add_theme_constant_override("outline_size", 3)
+		sprite.add_child(label)
+
+
+func _create_status_label() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 1001
+	add_child(layer)
+	calibration_panel = ColorRect.new()
+	var viewport_size := get_viewport().get_visible_rect().size
+	calibration_panel.size = Vector2(
+		minf(190.0, viewport_size.x - 24.0),
+		minf(116.0, viewport_size.y - 36.0)
+	)
+	calibration_panel.position = (viewport_size - calibration_panel.size) * 0.5
+	calibration_panel.color = Color(0.03, 0.06, 0.10, 0.94)
+	layer.add_child(calibration_panel)
+	var title := Label.new()
+	title.position = Vector2(6, 6)
+	title.size = Vector2(calibration_panel.size.x - 12, 12)
+	title.text = "GRIP SETUP"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 5)
+	title.add_theme_color_override("font_color", Color(1.0, 0.72, 0.18))
+	calibration_panel.add_child(title)
+	step_label = Label.new()
+	step_label.position = Vector2(6, 20)
+	step_label.size = Vector2(calibration_panel.size.x - 12, 11)
+	step_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	step_label.add_theme_font_size_override("font_size", 5)
+	step_label.text = "CONNECTING..."
+	calibration_panel.add_child(step_label)
+	status_label = Label.new()
+	status_label.position = Vector2(8, 35)
+	status_label.size = Vector2(calibration_panel.size.x - 16, 32)
+	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	status_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	status_label.add_theme_font_size_override("font_size", 6)
+	status_label.add_theme_color_override("font_outline_color", Color.BLACK)
+	status_label.add_theme_constant_override("outline_size", 2)
+	status_label.text = "Waiting for Gripballs..."
+	calibration_panel.add_child(status_label)
+	progress_bar = ProgressBar.new()
+	value_label = Label.new()
+	value_label.position = Vector2(6, 72)
+	value_label.size = Vector2(calibration_panel.size.x - 12, 10)
+	value_label.text = "RAW --   BASE --   FORCE --"
+	value_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	value_label.add_theme_font_size_override("font_size", 5)
+	value_label.add_theme_color_override("font_color", Color(0.72, 0.90, 1.0))
+	calibration_panel.add_child(value_label)
+	progress_bar.position = Vector2(12, 86)
+	progress_bar.size = Vector2(calibration_panel.size.x - 24, 8)
+	progress_bar.min_value = 0
+	progress_bar.max_value = 100
+	progress_bar.show_percentage = false
+	calibration_panel.add_child(progress_bar)
+	var hint := Label.new()
+	hint.position = Vector2(6, 99)
+	hint.size = Vector2(calibration_panel.size.x - 12, 10)
+	hint.text = "CONNECT THEN START"
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.add_theme_font_size_override("font_size", 5)
+	hint.add_theme_color_override("font_color", Color(0.65, 0.72, 0.78))
+	calibration_panel.add_child(hint)
+
+
+func _update_tracking(delta: float) -> void:
+	if party_mode:
+		_update_party_tracking(delta)
+		return
+	if tracking_strength <= 0.01:
+		return
+	var duck := get_tree().current_scene.find_child("Duck", true, false)
+	if duck and duck.get("input_pickable"):
+		var target: Vector2 = duck.global_position
+		var speed := lerpf(TRACK_SPEED_MIN, TRACK_SPEED_MAX, tracking_strength)
+		virtual_position = virtual_position.move_toward(target, speed * delta)
+		crosshair.position = virtual_position
+		var now := Time.get_ticks_msec() / 1000.0
+		if now - last_feedback_time >= 0.22:
+			var diagonal := get_viewport().get_visible_rect().size.length()
+			var distance := virtual_position.distance_to(target)
+			var closeness := 1.0 - clampf(distance / (diagonal * 0.65), 0.0, 1.0)
+			var intensity := roundi(20.0 + closeness * 75.0)
+			if web_mode:
+				JavaScriptBridge.eval(
+					"window.gripballBridge && window.gripballBridge.proximity(%d)" % intensity,
+					true
+				)
+			else:
+				feedback_udp.put_packet(
+					JSON.stringify({"type": "proximity", "intensity": intensity}).to_utf8_buffer()
+				)
+			last_feedback_time = now
+
+
+func _update_party_tracking(delta: float) -> void:
+	if party_crosshairs.is_empty():
+		return
+	var scene := get_tree().current_scene
+	var viewport_size := get_viewport().get_visible_rect().size
+	for player_id in party_crosshairs.keys():
+		var sprite: Sprite2D = party_crosshairs[player_id]
+		var strength := float(party_strengths.get(player_id, 0.0))
+		var current: Vector2 = party_positions.get(player_id, sprite.position)
+		if strength <= 0.01:
+			party_positions[player_id] = current
+			sprite.position = current
+			continue
+		var target := Vector2.ZERO
+		var has_target := false
+		if scene and scene.has_method("_get_gripball_player_target"):
+			var raw_target = scene._get_gripball_player_target(player_id)
+			if raw_target is Vector2:
+				target = raw_target
+				has_target = true
+		if not has_target:
+			continue
+		var to_target := target - current
+		var distance := to_target.length()
+		var direction := to_target.normalized() if distance > 0.001 else Vector2.ZERO
+		var perpendicular := Vector2(-direction.y, direction.x)
+		var phase := float(party_wobble_phase.get(player_id, 0.0)) + delta * lerpf(2.4, 6.5, strength)
+		party_wobble_phase[player_id] = phase
+		var wobble_size := lerpf(PARTY_WOBBLE_MAX, PARTY_WOBBLE_MIN, strength)
+		wobble_size *= clampf(distance / 160.0, 0.30, 1.0)
+		var wobble := perpendicular * sin(phase) * wobble_size
+		wobble += direction.rotated(0.65) * sin(phase * 0.53 + player_id) * wobble_size * 0.45
+		var chase_target := target + wobble
+		var speed := lerpf(PARTY_TRACK_SPEED_MIN, PARTY_TRACK_SPEED_MAX, strength)
+		current = current.move_toward(chase_target, speed * delta)
+		current = current.clamp(Vector2.ZERO, viewport_size)
+		party_positions[player_id] = current
+		sprite.position = current
+
+
+func _send_click(pressed: bool) -> void:
+	if pressed:
+		_try_hit_duck()
+	var event := InputEventMouseButton.new()
+	event.button_index = MOUSE_BUTTON_LEFT
+	event.button_mask = MOUSE_BUTTON_MASK_LEFT if pressed else 0
+	event.pressed = pressed
+	event.position = virtual_position
+	event.global_position = event.position
+	Input.parse_input_event(event)
+
+
+func _try_hit_duck() -> void:
+	var duck := get_tree().current_scene.find_child("Duck", true, false)
+	if not duck or not duck.get("input_pickable"):
+		return
+	var collision := duck.get_node_or_null("CollisionShape2D") as CollisionShape2D
+	if not collision or not collision.shape:
+		return
+	if collision.shape.get_rect().has_point(collision.to_local(virtual_position)):
+		duck.shoot()

@@ -13,7 +13,6 @@
   const CALIBRATION_MAX_PRESS_FORCE = 220;
   const CALIBRATION_DIP_GRACE_MS = 260;
   const CALIBRATION_STEP_TIMEOUT_MS = 15000;
-  const CALIBRATION_BASELINE_CREEP = 12;
   const SHOT_COOLDOWN_MS = 1150;
   const MOTION_REARM_MS = 140;
 
@@ -28,6 +27,41 @@
   const REST_FLAT_SAMPLES = 30;
   const REST_FLAT_TOLERANCE = 24;
   const REST_TIMEOUT_MS = 20000;
+  // After a squeeze the sensor does not snap back - it creeps down over seconds. Demanding
+  // a flat reading can therefore never be satisfied, which is what used to time the whole
+  // calibration out. So: accept a reading that is still drifting as long as it is drifting
+  // DOWNWARDS and slowly, and treat "settling" as a soft goal with a fallback rather than
+  // a hard gate.
+  const REST_SETTLE_TOLERANCE = 70;   // loosened window used once we are past REST_PATIENT_MS
+  const REST_PATIENT_MS = 2600;       // after this long, stop demanding a dead-flat reading
+  // A downward drift no steeper than this (per half-window, ~375ms) counts as settled.
+  // Kept small: accepting a fast decay means recording a baseline well above true rest,
+  // which makes every later press read weaker and fails calibration a different way.
+  const REST_DECAY_MAX = 12;
+  // Hard ceiling on how long a capture waits. A hard squeeze on a creepy sensor can take
+  // 25s+ for the trend to flatten, which is far longer than anyone will hold still for.
+  // Past this point, any downward drift is accepted and autoZeroDown() cleans up the rest.
+  const REST_GIVE_UP_MS = 5000;
+  const REST_MIN_SAMPLES = 12;        // enough to take a median from
+  // "Released" means the reading has come back to within this much of the baseline. Pan
+  // measured the real settling point at roughly a thousand counts above baseline, so this
+  // allowance is deliberately generous - waiting for closer is waiting out creep that takes
+  // many seconds.
+  //
+  // It is a cold-start value only, used before any press has been measured. It cannot be a
+  // permanent floor: the bars have to satisfy
+  //
+  //     release bar  <  press bar  <=  what the ball can actually produce
+  //
+  // and a hard floor of 1000 forces the press bar to ~1600, which a ball whose full squeeze
+  // reads 1400 can never clear - calibration would become impossible instead of merely slow.
+  // So once a press has been measured the ratios take over and this value steps aside.
+  const REST_RELEASE_MIN = 1000;
+  const REST_RELEASE_RATIO = 0.55;
+  // A press must clear this fraction of what the ball has been seen to produce. Sits above
+  // REST_RELEASE_RATIO with margin, so a released-but-still-creeping ball cannot pass the
+  // press check on residual alone.
+  const CALIBRATION_PRESS_RATIO = 0.8;
 
   const SHAKE_REST_MS = 900;
   const SHAKE_SAMPLE_MS = 2500;
@@ -170,6 +204,7 @@
       holding: false,
       holdSince: 0,
       gripLog: [],
+      zeroLog: [],
       gripNoise: 0,
       lastGripAt: 0,
       accel: null,
@@ -487,25 +522,86 @@
     }
   }
 
+  /**
+   * Continuous downward auto-zero, used throughout calibration.
+   *
+   * A live reading below the baseline is, by definition, a better estimate of rest than the
+   * baseline is - so adopt it. This is what makes the whole calibration tolerant of sensor
+   * creep: the initial capture is allowed to settle on a value that is still a little high
+   * (rather than waiting out a creep that can take ten seconds), and the remaining error is
+   * walked off during the moments the player is not pressing.
+   *
+   * Only ever downward. Moving it up would let a press redefine rest, so the ball would
+   * chase the player's grip and no press would ever register.
+   */
+  function autoZeroDown(player) {
+    if (!gripIsLive(player)) return false;
+    const log = player.zeroLog;
+    log.push(player.grip);
+    while (log.length > REST_MIN_SAMPLES) log.shift();
+    if (log.length < REST_MIN_SAMPLES) return false;
+    const half = Math.floor(log.length / 2);
+    const drift = median(log.slice(half)) - median(log.slice(0, half));
+    // While the sensor is still creeping down, follow the newest readings: a median over
+    // the window lags behind a falling signal, and that lag is exactly the residual error
+    // we are trying to remove. Once it has stopped falling, switch to the median so the
+    // baseline settles in the middle of the noise band rather than at the bottom of it -
+    // tracking the minimum would leave a constant phantom force at rest.
+    const falling = drift < -REST_DECAY_MAX;
+    const rested = falling ? median(log.slice(half)) : median(log);
+    if (!(rested < player.baseline)) return false;
+    player.baseline = rested;
+    return true;
+  }
+
+  /**
+   * Settle on a resting value for the sensor.
+   *
+   * The sensor creeps downward for seconds after being squeezed, so this accepts three
+   * different kinds of "settled", loosening as it waits:
+   *   1. genuinely flat (the old behaviour, and still the fastest path)
+   *   2. within a looser window, once we have been patient a while
+   *   3. drifting, but downwards and slowly - i.e. relaxing, not being pressed
+   * If none of those happen before the timeout it takes the best estimate it has and
+   * carries on. Timing out here used to abort the whole calibration, which is a much worse
+   * outcome than a slightly imperfect baseline: play-phase auto-zeroing corrects the
+   * baseline anyway, but a failed calibration means starting over.
+   */
   async function captureRestBaseline(player, label, progress) {
     const samples = [];
     const start = performance.now();
     let flatSince = 0;
     let lastUi = 0;
+    let settled = false;
     while (true) {
       const now = performance.now();
-      if (now - start > REST_TIMEOUT_MS) {
-        throw new Error(
-          `P${player.playerId + 1} 靜置讀數抓不穩（raw ${player.grip == null ? "--" : Math.round(player.grip)}）`
-        );
-      }
+      const waited = now - start;
+      if (waited > REST_TIMEOUT_MS) break;
       if (gripIsLive(player)) {
         samples.push(player.grip);
         while (samples.length > REST_FLAT_SAMPLES) samples.shift();
-        if (samples.length >= REST_FLAT_SAMPLES) {
+        if (samples.length >= REST_MIN_SAMPLES) {
           const lo = Math.min(...samples);
           const hi = Math.max(...samples);
-          if (hi - lo <= REST_FLAT_TOLERANCE) {
+          const spread = hi - lo;
+          // Compare the two halves of the window: a negative step means the reading is
+          // relaxing towards rest, which is fine to accept even though it is not flat.
+          const half = Math.floor(samples.length / 2);
+          const drift = median(samples.slice(half)) - median(samples.slice(0, half));
+          const patient = waited >= REST_PATIENT_MS;
+          // Two independent conditions, because the fast path alone is unsatisfiable on
+          // some balls: raw spread mixes the creep trend together with sensor noise, so a
+          // ball noisier than REST_FLAT_TOLERANCE never looks flat no matter how long you
+          // wait - which is one of the ways calibration used to hang.
+          //
+          // The patient path therefore judges the trend (drift) separately from the noise
+          // around it, and tolerates a wider noise band. Once the trend is slow, autoZeroDown()
+          // takes care of whatever offset remains, so there is no need to wait the creep out.
+          const ok =
+            spread <= REST_FLAT_TOLERANCE ||
+            (patient && Math.abs(drift) <= REST_DECAY_MAX && spread <= REST_SETTLE_TOLERANCE) ||
+            (waited >= REST_GIVE_UP_MS && drift <= 0);
+          if (ok) {
             if (!flatSince) flatSince = now;
           } else {
             flatSince = 0;
@@ -515,18 +611,146 @@
         flatSince = 0;
         samples.length = 0;
       }
-      if (flatSince && now - flatSince >= REST_FLAT_MS) break;
+      if (flatSince && now - flatSince >= REST_FLAT_MS) { settled = true; break; }
       if (now - lastUi > 90) {
         emitCalibration(player, label, progress || 0);
         lastUi = now;
       }
       await sleep(25);
     }
-    player.baseline = median(samples);
-    player.gripNoise = medianAbsoluteDeviation(samples, player.baseline);
+    // Only a total absence of data is still fatal - that means the ball is asleep or
+    // disconnected, which no amount of patience fixes.
+    if (samples.length < REST_MIN_SAMPLES) {
+      throw new Error(
+        `P${player.playerId + 1} 收不到壓力資料，請按一下球喚醒它（raw ${player.grip == null ? "--" : Math.round(player.grip)}）`
+      );
+    }
+    // Take the newest samples: while the sensor is creeping down, the most recent readings
+    // are the closest to true rest. Biasing the baseline slightly low is also the safer
+    // error - it makes presses read stronger, and play-phase auto-zeroing pulls it back up.
+    const recent = samples.slice(-REST_MIN_SAMPLES);
+    player.baseline = median(recent);
+    // Noise must be measured on the same short window; over the whole buffer the creep
+    // itself would count as noise and inflate the press threshold derived from it.
+    player.gripNoise = Math.min(
+      CALIBRATION_MAX_PRESS_FORCE / 8,
+      medianAbsoluteDeviation(recent, player.baseline)
+    );
     player.holding = false;
     player.holdSince = 0;
     player.gripLog.length = 0;
+    // Hand the same window to autoZeroDown() so it can act on the very next sample rather
+    // than spending another REST_MIN_SAMPLES building up history from scratch.
+    player.zeroLog.length = 0;
+    player.zeroLog.push(...recent);
+    if (!settled) {
+      console.warn(
+        `P${player.playerId + 1} baseline taken while still drifting ` +
+        `(raw ${Math.round(player.baseline)}, noise ${Math.round(player.gripNoise)})`
+      );
+    }
+    return settled;
+  }
+
+  /**
+   * How far above the baseline still counts as "let go of".
+   *
+   * Observed on real hardware: after a squeeze the reading settles a long way above the
+   * baseline - roughly a thousand counts - and waiting for it to come closer is just waiting
+   * out creep that takes many seconds. So the bar for "released" is deliberately generous.
+   *
+   * The constraint is that it must stay clear of what counts as a press. If the residual a
+   * released ball sits at is itself above the press bar, the next round's press check passes
+   * the instant it starts and records the residual as the peak. Both bars therefore scale
+   * off the same measured press magnitude, so the gap between them is preserved whatever the
+   * ball's range turns out to be.
+   */
+  function releaseForceFor(pressMagnitude) {
+    if (!(pressMagnitude > 0)) return REST_RELEASE_MIN;
+    // The generous absolute allowance only applies while it still leaves the press bar room
+    // underneath the ball's actual range; past that, the ratio governs. Taking the smaller of
+    // the two is what keeps the ordering above satisfiable on weak and strong balls alike.
+    return Math.min(REST_RELEASE_MIN, pressMagnitude * REST_RELEASE_RATIO);
+  }
+
+  /**
+   * How much force counts as a press, once we have seen this ball produce one.
+   *
+   * The noise-derived bar is capped at CALIBRATION_MAX_PRESS_FORCE (220), which is fine as a
+   * cold start but far too low for a ball whose full squeeze reads ~1400: a released ball
+   * still sitting a thousand counts high would sail past a 220 bar and the round would
+   * "pass" on residual creep alone. Scaling the bar to the measured press keeps it
+   * comfortably above the released residual, which is what makes the generous release bar
+   * safe.
+   */
+  function pressBarFor(pressMagnitude, fallback) {
+    if (!(pressMagnitude > 0)) return fallback;
+    // Never ask for more than the ball has been seen to give - a bar above the ball's own
+    // range is unreachable by definition.
+    const scaled = Math.min(pressMagnitude, pressMagnitude * CALIBRATION_PRESS_RATIO);
+    return Math.max(CALIBRATION_MIN_PRESS_FORCE, scaled);
+  }
+
+  /**
+   * Between press rounds we only need the ball to be let go of - not to be perfectly
+   * still. Re-running captureRestBaseline() here was the main reason calibration stalled:
+   * it demanded a settled sensor three times over, right after each squeeze, which is
+   * exactly when the sensor is least settled.
+   *
+   * Also tracks the floor the reading reaches, and nudges the baseline down to it. Without
+   * that, a baseline captured before the first press drifts stale over three rounds and
+   * every later press reads weaker than it was.
+   */
+  async function waitForRelease(player, label, progress, releaseForce) {
+    const start = performance.now();
+    let lastUi = 0;
+    let belowSince = 0;
+    let floor = Infinity;
+    let released = false;
+    while (performance.now() - start < REST_TIMEOUT_MS) {
+      const now = performance.now();
+      if (gripIsLive(player)) {
+        if (player.grip < floor) floor = player.grip;
+        autoZeroDown(player);
+        const force = player.grip - player.baseline;
+        if (force < releaseForce) {
+          if (!belowSince) belowSince = now;
+          if (now - belowSince >= 320) { released = true; break; }
+        } else {
+          belowSince = 0;
+        }
+      } else {
+        belowSince = 0;
+      }
+      if (now - lastUi > 90) {
+        emitCalibration(player, label, progress || 0);
+        lastUi = now;
+      }
+      await sleep(25);
+    }
+    if (!Number.isFinite(floor)) {
+      // No readings at all - leave the baseline alone rather than corrupt it.
+    } else if (released) {
+      // autoZeroDown() has already tracked the reading down sample by sample, so nothing
+      // more is needed here on the happy path.
+    } else {
+      // Never came back down. The sensor has plateaued above where it started, so that
+      // plateau is the new rest - adopt it. Leaving the old baseline in place would mean
+      // walking into the next press round already reading a few hundred of "force", which
+      // passes the press check instantly and records a garbage peak.
+      //
+      // The cost of being wrong here is bounded: the press threshold is derived once from
+      // the initial rested capture rather than from this value, and play-phase auto-zeroing
+      // re-derives the baseline again anyway.
+      player.baseline = floor;
+      console.warn(
+        `P${player.playerId + 1} never released; adopting ${Math.round(floor)} as baseline`
+      );
+    }
+    player.holding = false;
+    player.holdSince = 0;
+    player.gripLog.length = 0;
+    return released;
   }
 
   async function calibrateShake(player) {
@@ -535,6 +759,9 @@
     let lastUi = 0;
     while (performance.now() - restStart < SHAKE_REST_MS) {
       if (player.accel != null) restSamples.push(player.accel);
+      // The ball is being held still and not pressed here, which is the best chance in the
+      // whole sequence to shed any baseline error left over from sensor creep.
+      autoZeroDown(player);
       if (performance.now() - lastUi > 90) {
         emitCalibration(player, "HOLD STILL - DO NOT SHAKE", 0);
         lastUi = performance.now();
@@ -605,29 +832,58 @@
     await waitForStream(player, "PRESS BALL ONCE TO WAKE");
     await captureRestBaseline(player, "HOLD BALL - DO NOT PRESS", 0);
 
+    // Derive the press bar once, from the noise measured on a genuinely rested sensor. It
+    // used to be recomputed each round from a baseline captured moments after a squeeze,
+    // where sensor creep inflates the noise estimate - so the bar climbed round by round and
+    // the player was asked to press ever harder to pass.
+    //
+    // Round 1 has no measured press to scale from, so it starts from the noise-derived bar.
+    // From round 2 on, pressBarFor() rescales both bars off what this ball actually produces.
+    let pressMagnitude = 0;
+    const pressMagnitudes = [];
+    let pressThreshold = Math.min(
+      CALIBRATION_MAX_PRESS_FORCE,
+      Math.max(CALIBRATION_MIN_PRESS_FORCE, (player.gripNoise || 0) * 8 + 55)
+    );
+    let resetThreshold = Math.max(35, pressThreshold * 0.58);
+
     const peaks = [];
     for (let round = 1; round <= CALIBRATION_ROUNDS; round += 1) {
       const baseProgress = (round - 1) / CALIBRATION_ROUNDS * 100;
-      await captureRestBaseline(player, `RELEASE BEFORE ${round}/${CALIBRATION_ROUNDS}`, baseProgress);
+      // Round 1 follows the initial baseline capture, so the ball is already at rest.
+      if (round > 1) {
+        pressThreshold = pressBarFor(pressMagnitude, pressThreshold);
+        resetThreshold = Math.max(35, pressThreshold * 0.58);
+        await waitForRelease(
+          player, `RELEASE BEFORE ${round}/${CALIBRATION_ROUNDS}`, baseProgress,
+          releaseForceFor(pressMagnitude)
+        );
+      }
       await haptic(player, 60, 45);
       let holdStart = 0;
       let peak = player.grip || player.baseline;
       let peakForce = 0;
       let lastUi = 0;
-      const pressThreshold = Math.min(
-        CALIBRATION_MAX_PRESS_FORCE,
-        Math.max(CALIBRATION_MIN_PRESS_FORCE, (player.gripNoise || 0) * 8 + 55)
-      );
-      const resetThreshold = Math.max(35, pressThreshold * 0.58);
       const pressStarted = performance.now();
       let dipStart = 0;
       while (true) {
         const now = performance.now();
         if (now - pressStarted > CALIBRATION_STEP_TIMEOUT_MS) {
+          // A round that got most of the way there is worth keeping: the peak is a median
+          // over rounds, so one soft round barely moves it, whereas failing the whole
+          // calibration costs the player every round they already did.
+          if (peakForce >= pressThreshold * 0.6) {
+            console.warn(
+              `P${player.playerId + 1} round ${round} accepted soft ` +
+              `(${Math.round(peakForce)} of ${Math.round(pressThreshold)})`
+            );
+            break;
+          }
           throw new Error(
             `P${player.playerId + 1} 按壓不足（需 ${Math.round(pressThreshold)}，最高 ${Math.round(peakForce)}）`
           );
         }
+        autoZeroDown(player);
         const force = gripIsLive(player) ? player.grip - player.baseline : 0;
         peak = Math.max(peak, player.grip || peak);
         peakForce = Math.max(peakForce, force);
@@ -655,6 +911,11 @@
         await sleep(20);
       }
       peaks.push(peak);
+      // Feed the measured press magnitude forward, so later rounds scale both the press and
+      // release bars off this ball's real range rather than the cold-start guess. Median of
+      // what we have seen, so one unusually soft or hard round does not swing the bars.
+      pressMagnitudes.push(peakForce);
+      pressMagnitude = median(pressMagnitudes);
       emitCalibration(player, `RECORDED ${round}/${CALIBRATION_ROUNDS}`, round / CALIBRATION_ROUNDS * 100, peak);
       await haptic(player, 35, 25);
     }
@@ -1223,6 +1484,219 @@
       } catch (error) {
         console.warn("Duck HRTF spatial audio failed", error);
         return false;
+      }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Aim-tracking tone
+    //
+    // A sustained synth voice per crosshair while the player is tracking a duck: pitch
+    // rises as the crosshair closes on the duck (the "getting warmer" cue), and the voice
+    // is spatialized at the crosshair's own position on screen.
+    //
+    // Unlike the one-shot duck sounds, this voice keeps sounding while it moves, so
+    // switching IRs under it would click. This is the case that needs the A/B convolver
+    // crossfade from SonicSquid's G07_Binamix: two convolvers, the inactive one gets the
+    // new IR, then a short equal-power-ish ramp hands over between them.
+    // ---------------------------------------------------------------------------------
+    const TONE_MIN_HZ = 196;          // G3 when the crosshair is nowhere near the duck
+    const TONE_MAX_HZ = 784;          // G5 when it is right on top of it
+    const TONE_PEAK_GAIN = 0.16;      // deliberately well under the game's own sounds
+    const TONE_FADE_MS = 90;          // in/out, and the IR handover
+    const TONE_GLIDE_MS = 70;         // pitch/volume smoothing between updates
+    const voices = new Map();
+
+    function makeTrackingVoice(id) {
+      const context = getContext();
+      // Two oscillators a hair apart beat gently against each other, which makes the
+      // pitch movement much easier to hear than a bare sine.
+      const oscA = context.createOscillator();
+      const oscB = context.createOscillator();
+      oscA.type = "triangle";
+      oscB.type = "sine";
+      // Each player gets a slightly different detune so several tracking tones at once
+      // stay tellable apart in Party Mode.
+      const detune = 4 + (id % 4) * 3;
+      oscB.detune.value = detune;
+
+      const mix = context.createGain();
+      mix.gain.value = 0.5;
+      const tone = context.createGain();
+      tone.gain.value = 0;        // silent until the first update fades it in
+      const airFilter = context.createBiquadFilter();
+      airFilter.type = "lowpass";
+      airFilter.frequency.value = 16000;
+
+      oscA.connect(mix);
+      oscB.connect(mix);
+      mix.connect(tone);
+      tone.connect(airFilter);
+
+      const voice = {
+        id, context, oscA, oscB, tone, airFilter,
+        started: false, stopping: false,
+        irName: null, activeConv: "A", convA: null, convB: null, gainA: null, gainB: null,
+        panner: null,
+      };
+
+      // Pick a spatialization path once, for the voice's whole life: swapping between
+      // convolver and panner mid-note would be audible.
+      const startingIr = hrir.ready ? hrirNameFor({lateral: 0, vertical: 0, dist: 0}) : null;
+      const startingBuffer = startingIr ? hrir.buffers[startingIr] : null;
+      if (startingBuffer) {
+        voice.convA = context.createConvolver();
+        voice.convB = context.createConvolver();
+        voice.convA.normalize = false;
+        voice.convB.normalize = false;
+        voice.convA.buffer = startingBuffer;
+        voice.convB.buffer = startingBuffer;
+        voice.gainA = context.createGain();
+        voice.gainB = context.createGain();
+        voice.gainA.gain.value = 1;
+        voice.gainB.gain.value = 0;
+        voice.irName = startingIr;
+        const boost = context.createGain();
+        boost.gain.value = HRIR_BOOST;
+        airFilter.connect(voice.convA);
+        airFilter.connect(voice.convB);
+        voice.convA.connect(voice.gainA);
+        voice.convB.connect(voice.gainB);
+        voice.gainA.connect(boost);
+        voice.gainB.connect(boost);
+        boost.connect(master);
+      } else {
+        voice.panner = context.createPanner();
+        voice.panner.panningModel = "HRTF";
+        voice.panner.distanceModel = "inverse";
+        voice.panner.refDistance = 1;
+        voice.panner.maxDistance = 7;
+        voice.panner.rolloffFactor = 0.45;
+        airFilter.connect(voice.panner);
+        voice.panner.connect(master);
+        if (hrir.ready && startingIr) loadHrirBuffer(startingIr);
+      }
+      return voice;
+    }
+
+    function setVoicePosition(voice, vector) {
+      const context = voice.context;
+      const now = context.currentTime;
+      if (voice.panner) {
+        const x = vector.lateral * 2.9;
+        const y = vector.vertical * 0.85;
+        const z = -1.35 - Math.min(1.8, vector.dist * 0.7);
+        if (voice.panner.positionX) {
+          voice.panner.positionX.setTargetAtTime(x, now, 0.02);
+          voice.panner.positionY.setTargetAtTime(y, now, 0.02);
+          voice.panner.positionZ.setTargetAtTime(z, now, 0.02);
+        } else {
+          voice.panner.setPosition(x, y, z);
+        }
+        return;
+      }
+      const wanted = hrirNameFor(vector);
+      if (!wanted || wanted === voice.irName) return;
+      const buffer = hrir.buffers[wanted];
+      if (!buffer) {
+        // Not decoded yet: keep sounding through the IR we already have and fetch this
+        // one for next time. Never go quiet mid-note waiting on the network.
+        loadHrirBuffer(wanted);
+        return;
+      }
+      const fade = TONE_FADE_MS / 1000;
+      const activeGain = voice.activeConv === "A" ? voice.gainA : voice.gainB;
+      const idleGain = voice.activeConv === "A" ? voice.gainB : voice.gainA;
+      const idleConv = voice.activeConv === "A" ? voice.convB : voice.convA;
+      idleConv.buffer = buffer;
+      for (const param of [activeGain.gain, idleGain.gain]) {
+        param.cancelScheduledValues(now);
+        param.setValueAtTime(param.value, now);
+      }
+      activeGain.gain.linearRampToValueAtTime(0, now + fade);
+      idleGain.gain.linearRampToValueAtTime(1, now + fade);
+      voice.activeConv = voice.activeConv === "A" ? "B" : "A";
+      voice.irName = wanted;
+    }
+
+    function updateVoice(voice, closeness, vector) {
+      const context = voice.context;
+      const now = context.currentTime;
+      const glide = TONE_GLIDE_MS / 1000;
+      if (!voice.started) {
+        voice.oscA.start();
+        voice.oscB.start();
+        voice.started = true;
+      }
+      // Pitch in semitones rather than Hz, so the rise sounds evenly paced rather than
+      // bunched up at the bottom.
+      const octaves = Math.log2(TONE_MAX_HZ / TONE_MIN_HZ);
+      const hz = TONE_MIN_HZ * Math.pow(2, octaves * Math.max(0, Math.min(1, closeness)));
+      voice.oscA.frequency.setTargetAtTime(hz, now, glide);
+      voice.oscB.frequency.setTargetAtTime(hz, now, glide);
+      // Swell a little as it closes in, so the cue reads even at a glance-level of
+      // attention, but never loud enough to fight the quacks.
+      const level = TONE_PEAK_GAIN * (0.55 + 0.45 * closeness);
+      voice.tone.gain.setTargetAtTime(level, now, glide);
+      const depth = Math.min(1, vector.dist);
+      voice.airFilter.frequency.setTargetAtTime(
+        Math.max(1200, 16000 - depth * 11000), now, glide
+      );
+      setVoicePosition(voice, vector);
+    }
+
+    function stopVoice(voice) {
+      if (voice.stopping) return;
+      voice.stopping = true;
+      const context = voice.context;
+      const now = context.currentTime;
+      const fade = TONE_FADE_MS / 1000;
+      voice.tone.gain.cancelScheduledValues(now);
+      voice.tone.gain.setValueAtTime(voice.tone.gain.value, now);
+      voice.tone.gain.linearRampToValueAtTime(0, now + fade);
+      if (voice.started) {
+        voice.oscA.stop(now + fade + 0.02);
+        voice.oscB.stop(now + fade + 0.02);
+      }
+    }
+
+    // Called from gripball_input.gd every few frames with the full set of crosshairs that
+    // are currently tracking. Anything previously sounding and absent from this list gets
+    // faded out, so there is no separate "stop" bookkeeping on the Godot side.
+    function syncTracking(payload, vw, vh) {
+      try {
+        const active = typeof payload === "string" ? JSON.parse(payload) : payload;
+        if (!Array.isArray(active)) return false;
+        getContext();
+        const seen = new Set();
+        for (const entry of active) {
+          if (!entry) continue;
+          const id = Number(entry.id) || 0;
+          const closeness = Math.max(0, Math.min(1, Number(entry.closeness) || 0));
+          seen.add(id);
+          let voice = voices.get(id);
+          if (!voice || voice.stopping) {
+            voice = makeTrackingVoice(id);
+            voices.set(id, voice);
+          }
+          const vector = sourceVector(Number(entry.x) || 0, Number(entry.y) || 0, vw, vh);
+          updateVoice(voice, closeness, vector);
+        }
+        for (const [id, voice] of voices) {
+          if (seen.has(id)) continue;
+          stopVoice(voice);
+          voices.delete(id);
+        }
+        return true;
+      } catch (error) {
+        console.warn("Duck tracking tone failed", error);
+        return false;
+      }
+    }
+
+    function stopAllTracking() {
+      for (const [id, voice] of voices) {
+        stopVoice(voice);
+        voices.delete(id);
       }
     }
 

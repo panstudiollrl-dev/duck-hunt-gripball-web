@@ -1,0 +1,5 @@
+tools/__pycache__/
+
+# 1551 個 MeshRIR HRIR wav：改成 Web Audio HRTF PannerNode 之後就沒用到了，
+# 留在工作目錄方便日後比對，不進 repo（6MB）。
+hrir_wavs/

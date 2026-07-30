@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-把 repo 根目錄的 gripball_webhid.js 打包回 index.pck，並同步 index.html 的 fileSizes。
+把 repo 根目錄的來源檔打包回 index.pck，並同步 index.html 的 fileSizes。
+
+目前會替換兩個資源：
+    gripball_webhid.js  → res://web/gripball_webhid.js
+    duck.gd.reference   → res://scenes/duck.gd
 
 用法：
     python tools/patch_pck.py
 
 流程：
-    1. 讀取 gripball_webhid.js
-    2. 取代 index.pck 內的 res://web/gripball_webhid.js
+    1. 讀取上面每一個來源檔（缺檔就跳過該項，不會失敗）
+    2. 取代 index.pck 內對應的資源
     3. 重算該檔的 offset / size / md5，並重排後續檔案
     4. 更新 index.html 裡 GODOT_CONFIG.fileSizes["index.pck"]
-    5. 驗證：重新解析新 pck，逐檔比對其餘 101 個檔案是否完全一致
+    5. 驗證：重新解析新 pck，逐檔比對「沒被替換的檔案」是否 byte-for-byte 一致
 
 備註：Godot 4 執行時不會驗證 pck 內各檔的 md5，但這裡還是照規格重算，
       免得之後有工具去檢查。
@@ -26,8 +30,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PCK = ROOT / "index.pck"
 HTML = ROOT / "index.html"
-SOURCE = ROOT / "gripball_webhid.js"
-TARGET = "res://web/gripball_webhid.js"
+# 來源檔 → pck 內資源路徑。duck.gd 在 repo root 叫 duck.gd.reference，
+# 免得 Godot 專案或編輯器把 root 的 duck.gd 誤認成專案檔。
+REPLACEMENTS = {
+    "gripball_webhid.js": "res://web/gripball_webhid.js",
+    "duck.gd.reference": "res://scenes/duck.gd",
+}
 ALIGN = 16
 
 MAGIC = b"GDPC"
@@ -128,7 +136,8 @@ def build(pck, data):
     return bytes(out)
 
 
-def verify(new_bytes, original_entries, expected_js):
+def verify(new_bytes, original_entries, expected):
+    """expected: {pck 內路徑: 應該有的 bytes}。其餘檔案必須與原本完全相同。"""
     fresh = parse(new_bytes)
     before = {e["path"]: e["content"] for e in original_entries}
     after = {e["path"]: e["content"] for e in fresh["entries"]}
@@ -136,16 +145,21 @@ def verify(new_bytes, original_entries, expected_js):
     if before.keys() != after.keys():
         raise SystemExit("驗證失敗：檔案清單不一致")
 
+    untouched = 0
     for path, content in after.items():
-        expected = expected_js if path == TARGET else before[path]
-        if content != expected:
-            raise SystemExit(f"驗證失敗：{path} 內容不符")
+        if path in expected:
+            if content != expected[path]:
+                raise SystemExit(f"驗證失敗：{path} 內容不是預期的新版本")
+        else:
+            if content != before[path]:
+                raise SystemExit(f"驗證失敗：{path} 不該被動到，但內容變了")
+            untouched += 1
 
     for entry in fresh["entries"]:
         if hashlib.md5(entry["content"]).digest() != entry["md5"]:
             raise SystemExit(f"驗證失敗：{entry['path']} md5 不符")
 
-    return len(fresh["entries"])
+    return len(fresh["entries"]), untouched
 
 
 def update_html(new_size):
@@ -170,38 +184,50 @@ def update_html(new_size):
 
 
 def main():
-    if not SOURCE.exists():
-        raise SystemExit(f"找不到 {SOURCE}")
-
-    js = SOURCE.read_bytes()
     data = PCK.read_bytes()
     pck = parse(data)
-
     originals = [dict(e) for e in pck["entries"]]
-    target = next((e for e in pck["entries"] if e["path"] == TARGET), None)
-    if target is None:
-        raise SystemExit(f"pck 內找不到 {TARGET}")
+    by_path = {e["path"]: e for e in pck["entries"]}
 
-    if target["content"] == js:
+    expected = {}
+    changes = []
+    for source_name, target_path in REPLACEMENTS.items():
+        source = ROOT / source_name
+        if not source.exists():
+            print(f"跳過 {source_name}（檔案不存在）")
+            continue
+        entry = by_path.get(target_path)
+        if entry is None:
+            raise SystemExit(f"pck 內找不到 {target_path}")
+
+        content = source.read_bytes()
+        expected[target_path] = content
+        if entry["content"] == content:
+            print(f"{target_path} 已經是最新的")
+            continue
+        changes.append(f"{target_path}：{entry['size']} → {len(content)} bytes")
+        entry["content"] = content
+
+    if not changes:
         print("index.pck 內容已經是最新的，不需要更動。")
         return
 
-    print(f"更新 {TARGET}：{target['size']} → {len(js)} bytes")
-    target["content"] = js
+    for line in changes:
+        print("更新 " + line)
 
     new_bytes = build(pck, data)
-    checked = verify(new_bytes, originals, js)
+    checked, untouched = verify(new_bytes, originals, expected)
 
     PCK.write_bytes(new_bytes)
     old_size, new_size, changed = update_html(len(new_bytes))
 
-    print(f"驗證通過：{checked} 個檔案")
+    print(f"驗證通過：{checked} 個檔案，其中 {untouched} 個 byte-for-byte 未變動")
     print(f"index.pck: {len(data)} → {len(new_bytes)} bytes")
     if changed:
         print(f"index.html fileSizes: {old_size} → {new_size}")
     else:
         print("index.html fileSizes 不需更動")
-    print("\n完成。記得 commit index.pck、index.html 和 gripball_webhid.js 三個檔案。")
+    print("\n完成。記得 commit index.pck、index.html 和 gripball_webhid.js。")
 
 
 if __name__ == "__main__":

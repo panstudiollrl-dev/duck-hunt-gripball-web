@@ -1,0 +1,361 @@
+extends CharacterBody2D
+
+#####################################
+# DUCK HUNT REMASTERED              #
+# A fan game by Daniel the Fox      #
+# https://danielthefox.itch.io      #
+# https://github.com/Daniel-The-Fox #
+#####################################
+
+
+####
+# Inspired by the great tutorial "Duck Hunt in Godot 4" by 16BitDev.
+# See https://www.youtube.com/watch?v=gLzwaMF8Zbk
+# and https://github.com/16BitDev/duck-hunt/
+#
+# I made quite some changes and additions though! ;)
+# See https://github.com/Daniel-The-Fox/duck-hunt-remastered/blob/main/README.md
+####
+
+
+# Definde signals emitted by this script
+signal next_duck
+
+
+# Initialize nodes used in script
+@onready var animation_player = $AnimationPlayer
+@onready var cursor_manager = $CursorManager
+@onready var duck_drop_fall_player = $DuckDropFallPlayer
+@onready var duck_drop_hit_player = $DuckDropHitPlayer
+@onready var duck_quack_player = $DuckQuackPlayer
+@onready var duck_scream_player = $DuckScreamPlayer
+@onready var duck_sprite = $AnimatedSprite2D
+@onready var quack_timer: Timer = $QuackTimer
+@onready var wings_flap_player = $WingsFlapPlayer
+
+
+# General settings and status variables
+var current_duck_type: String
+var duck_death_animation_suffix = "_death"
+var duck_fall_animation_suffix = "_fall"
+var duck_fall_multiplier = 150
+var duck_fly_animation_suffix = "_fly"
+var duck_hit = false
+var duck_hit_position = Vector2(0, 0)
+var duck_initial_quack = true
+var duck_random_quack = true
+var duck_random_quack_min_sec = 2
+var duck_random_quack_max_sec = 5
+var duck_types = [
+	"brown",
+	"blue",
+	"red",
+]
+var speed: float = 100
+var active_spatial_quacks := []
+
+
+const DUCK_QUACK_VOLUME_DB = -8.0
+const DUCK_SCREAM_VOLUME_DB = -8.0
+const DUCK_DROP_VOLUME_DB = -9.0
+const DUCK_WINGS_VOLUME_DB = -12.0
+const DUCK_POSITIONAL_MAX_DISTANCE = 760.0
+const DUCK_POSITIONAL_ATTENUATION = 0.18
+const DUCK_POSITIONAL_PANNING_STRENGTH = 1.25
+
+
+# Function "_ready" is always called when node finished initial loading
+# See https://docs.godotengine.org/en/stable/classes/class_node.html#class-node-method-ready
+func _ready():
+	_apply_duck_audio_mix()
+	await _choose_random_duck_type(current_duck_type)
+	_update_current_duck_type()
+	wings_flap_player.play()
+	if duck_random_quack:
+		_random_duck_quack()
+	# This is now handled in the main scene's GDScript to be able
+	# to set a random starting x position for the duck.
+	# Keeping this here as a reminder, though.
+	#input_pickable = true
+	#velocity = random_up_direction() * speed
+
+
+# Function "_physics_process" is called during the physics processing step of the main loop
+# Note: This method is only called if the node is present in the scene tree and has a velocity > 0!
+# See https://docs.godotengine.org/en/stable/classes/class_node.html#class-node-method-physics-process
+# and https://kidscancode.org/godot_recipes/4.x/basics/understanding_delta/index.html
+func _physics_process(delta):
+	# move_and_collide() = Moves the body along the vector motion. Use delta to be frame independent.
+	# If the engine detects a collision anywhere along this vector, the body will immediately stop moving.
+	# See https://docs.godotengine.org/en/stable/tutorials/physics/using_character_body_2d.html
+	var _collision = move_and_collide(velocity * delta)
+	if _collision:
+		# velocity.bounce() returns a new vector after colliding
+		# See https://docs.godotengine.org/en/stable/tutorials/physics/physics_introduction.html#character-collision-response
+		# and https://docs.godotengine.org/en/stable/classes/class_characterbody2d.html#class-characterbody2d-property-velocity
+		# and https://docs.godotengine.org/en/stable/classes/class_vector2.html#class-vector2-method-bounce
+		velocity = velocity.bounce(_collision.get_normal())
+		#print(current_duck_type + " duck collided with ", _collision.get_collider().name)
+	if not duck_hit:
+		_keep_live_duck_in_flight_area()
+	duck_sprite.flip_h = velocity.x < 0
+	if duck_random_quack:
+		_random_duck_quack()
+
+
+func _keep_live_duck_in_flight_area() -> void:
+	var viewport_size := get_viewport_rect().size
+	var collision := get_node_or_null("CollisionShape2D") as CollisionShape2D
+	var half_height := 10.0
+	var half_width := 10.0
+	if collision and collision.shape:
+		var rect := collision.shape.get_rect()
+		half_width = max(half_width, rect.size.x * 0.5)
+		half_height = max(half_height, rect.size.y * 0.5)
+	var min_y := half_height + 4.0
+	var max_y := viewport_size.y - 74.0
+	var min_x := half_width
+	var max_x := viewport_size.x - half_width
+	if position.y > max_y:
+		position.y = max_y
+		velocity.y = -abs(velocity.y)
+		if abs(velocity.y) < speed * 0.35:
+			velocity.y = -speed * 0.55
+	elif position.y < min_y:
+		position.y = min_y
+		velocity.y = abs(velocity.y)
+	if position.x < min_x:
+		position.x = min_x
+		velocity.x = abs(velocity.x)
+	elif position.x > max_x:
+		position.x = max_x
+		velocity.x = -abs(velocity.x)
+
+
+# We connected the node "Duck" to the signal "input_event" which causes
+# the function "_on_input_event" to be called everytime an input event happens on the duck.
+# We're only interested in the case when the duck got hit though.
+# Requires input_pickable = true!
+#
+# See https://docs.godotengine.org/en/stable/classes/class_collisionobject2d.html#signals
+# and https://docs.godotengine.org/en/stable/classes/class_collisionobject2d.html#class-collisionobject2d-property-input-pickable
+# and https://docs.godotengine.org/en/stable/classes/class_inputevent.html#class-inputevent-method-is-action-pressed
+func _on_input_event(_viewport, event, _shape_idx):
+	if event.is_action_pressed("left_click") and input_pickable:
+		shoot()
+
+
+func shoot() -> void:
+	if not input_pickable or duck_hit:
+		return
+	duck_hit = true
+	input_pickable = false
+	wings_flap_player.stop()
+	quack_timer.stop()
+	duck_quack_player.stop()
+	_stop_active_spatial_quacks()
+	duck_hit_position = Vector2(roundi(self.position.x), roundi(self.position.y))
+	print("duck_hit_position: " + str(duck_hit_position))
+	_play_positioned_duck_sound(duck_scream_player)
+	velocity = Vector2.ZERO
+	animation_player.play(current_duck_type + duck_death_animation_suffix)
+	await get_tree().create_timer(0.6).timeout
+	_play_duck_drop_fall()
+	velocity = Vector2.DOWN * duck_fall_multiplier
+	duck_sprite.play(current_duck_type + duck_fall_animation_suffix)
+	await get_tree().create_timer(0.5).timeout
+	_play_duck_drop_hit()
+
+
+# Signal "screen_exited" on duck calls this function
+# when the current duck instance left the screen
+func _on_screen_exited():
+	print(current_duck_type + " duck exited screen")
+	next_duck.emit()
+	# queue_free() = Queues a node for deletion at the end of the current frame.
+	queue_free()
+
+
+# Calculate a random velocity vector of length 1 ("nomalized")
+# Attention: Assumes that "randomize()" is called in _ready of main scene!
+# See https://docs.godotengine.org/en/stable/tutorials/math/vector_math.html#vector-math
+# and https://docs.godotengine.org/en/stable/tutorials/math/random_number_generation.html
+func random_up_direction() -> Vector2:
+	var _randf_deg = randf_range(0, 180)
+	# Using trigonometric functions to calculate x and y coords from random angle.
+	# For details, see https://en.wikipedia.org/wiki/Unit_circle
+	# and https://en.wikipedia.org/wiki/Unit_circle#/media/File:Unit_circle_angles_color.svg
+	# and https://en.wikipedia.org/wiki/Exact_trigonometric_values
+	#
+	# Enforcing negative y value to force duck to fly upwards from the beginning,
+	# as duck will always start (spawn) at random x position inside grass in main scene.
+	#
+	# Transforming random angle in degree tro radians,
+	# as Godot's cos() and sin() functions only accept radians
+	# For details, see https://docs.godotengine.org/en/stable/classes/class_@globalscope.html#class-globalscope-method-cos
+	var _random_direction = Vector2(
+			cos(deg_to_rad(_randf_deg)),
+			sin(-1 * deg_to_rad(_randf_deg)),
+	)
+	#print("_randf_deg: " + str(_randf_deg))
+	#print("_random_direction: " + str(_random_direction))
+	#print("_random_direction.normalized(): " + str(_random_direction.normalized()))
+	return _random_direction.normalized()
+
+
+# Attention: Assumes that "randomize()" is called in _ready of main scene!
+# See https://docs.godotengine.org/en/stable/tutorials/math/random_number_generation.html
+func _choose_random_duck_type(_random_duck=""):
+	#print("current_animation duck: " + duck_sprite.get_animation())
+	if _random_duck.is_empty():
+		_random_duck = duck_types[randi_range(0, duck_types.size()-1)]
+	print("random duck: " + _random_duck)
+	if duck_initial_quack:
+		_play_duck_quack()
+	duck_sprite.play(_random_duck + duck_fly_animation_suffix)
+
+
+func _update_current_duck_type():
+	current_duck_type = duck_sprite.get_animation().split("_")[0]
+	if current_duck_type not in duck_types:
+		current_duck_type = duck_types[0]
+	#print("current_duck_type: " + current_duck_type)
+
+
+func _random_duck_quack():
+	if quack_timer.is_stopped():
+		var _current_wait = quack_timer.wait_time
+		while quack_timer.wait_time == _current_wait:
+			quack_timer.wait_time = randi_range(
+					duck_random_quack_min_sec,
+					duck_random_quack_max_sec,
+			)
+		quack_timer.one_shot = true
+		quack_timer.start()
+		#print("quack_timer started")
+		#print("Waiting " + str (quack_timer.wait_time) + " seconds before next quack")
+
+
+# Signal "mouse_entered" on duck calls this function
+func _on_mouse_entered() -> void:
+	# Set red crosshairs cursor to indicate that duck is shootable now
+	if input_pickable:
+		cursor_manager.set_crosshairs_cursor()
+
+
+# Signal "mouse_exited" on duck calls this function
+func _on_mouse_exited() -> void:
+	# Reset to default cursor to indicate that duck is NOT shootable anymore for now
+	cursor_manager.set_default_cursor()
+
+
+func _on_quack_timer_timeout() -> void:
+	_play_duck_quack()
+
+
+func _apply_duck_audio_mix() -> void:
+	duck_quack_player.volume_db = DUCK_QUACK_VOLUME_DB
+	duck_scream_player.volume_db = DUCK_SCREAM_VOLUME_DB
+	duck_drop_fall_player.volume_db = DUCK_DROP_VOLUME_DB
+	duck_drop_hit_player.volume_db = DUCK_DROP_VOLUME_DB
+	wings_flap_player.volume_db = DUCK_WINGS_VOLUME_DB
+
+
+func _play_duck_quack() -> void:
+	var player = _play_positioned_duck_sound(duck_quack_player)
+	if player:
+		active_spatial_quacks.append(player)
+
+
+func _play_positioned_duck_sound(source_player):
+	if not source_player or not source_player.stream:
+		return null
+	var sound_name := ""
+	if source_player == duck_quack_player:
+		sound_name = "quack"
+	elif source_player == duck_scream_player:
+		sound_name = "scream"
+	elif source_player == duck_drop_hit_player:
+		sound_name = "drop_hit"
+	if not sound_name.is_empty() and _play_web_meshrir_sound(sound_name):
+		return null
+	var scene = get_tree().current_scene
+	if not scene:
+		source_player.play()
+		return null
+
+	var player := AudioStreamPlayer2D.new()
+	player.stream = source_player.stream
+	player.bus = source_player.bus
+	player.volume_db = source_player.volume_db
+	player.global_position = global_position
+	_set_property_if_present(player, "max_distance", DUCK_POSITIONAL_MAX_DISTANCE)
+	_set_property_if_present(player, "attenuation", DUCK_POSITIONAL_ATTENUATION)
+	_set_property_if_present(player, "panning_strength", DUCK_POSITIONAL_PANNING_STRENGTH)
+	player.finished.connect(player.queue_free)
+	player.finished.connect(_forget_spatial_quack.bind(player))
+	scene.add_child(player)
+	player.play()
+	return player
+
+
+func _set_property_if_present(target, property_name: String, value) -> void:
+	for property in target.get_property_list():
+		if property.get("name") == property_name:
+			target.set(property_name, value)
+			return
+
+
+func _forget_spatial_quack(player) -> void:
+	active_spatial_quacks.erase(player)
+
+
+func _stop_active_spatial_quacks() -> void:
+	for player in active_spatial_quacks:
+		if is_instance_valid(player):
+			player.stop()
+			player.queue_free()
+	active_spatial_quacks.clear()
+
+
+func _play_duck_drop_fall() -> void:
+	if _play_web_meshrir_sound("drop_fall"):
+		return
+	duck_drop_fall_player.volume_db = DUCK_DROP_VOLUME_DB
+	duck_drop_fall_player.pitch_scale = 1.55
+	duck_drop_fall_player.play()
+	var tween := create_tween()
+	tween.tween_property(duck_drop_fall_player, "pitch_scale", 0.34, 0.38)
+	tween.parallel().tween_property(duck_drop_fall_player, "volume_db", -36.0, 0.55)
+	tween.tween_callback(duck_drop_fall_player.stop)
+
+
+# The landing thud. duck_drop_hit_player had its volume set in _apply_duck_audio_mix()
+# but was never played anywhere - so the only drop sound you actually heard was
+# drop_fall (the whistling descent). Positioned like quack/scream: try the Web HRTF
+# bridge first, fall back to Godot's own AudioStreamPlayer2D off the web.
+func _play_duck_drop_hit() -> void:
+	# shoot() awaits 0.5s before calling this; the duck can leave the screen and be
+	# queued for deletion in the meantime, and _play_web_meshrir_sound reads
+	# global_position / get_viewport_rect().
+	if not is_inside_tree():
+		return
+	# _play_positioned_duck_sound maps this player to "drop_hit" and tries the Web HRTF
+	# bridge itself, falling back to a positioned AudioStreamPlayer2D off the web.
+	_play_positioned_duck_sound(duck_drop_hit_player)
+
+
+func _play_web_meshrir_sound(sound_name: String) -> bool:
+	if not OS.has_feature("web"):
+		return false
+	var x := global_position.x
+	var y := global_position.y
+	# Send the game's own viewport size along with the position. x/y are viewport
+	# coordinates, so the JS side must divide by these - not by window.innerWidth/Height,
+	# which is a different coordinate space once the canvas is letterboxed or scaled.
+	var viewport_size := get_viewport_rect().size
+	var expression := (
+		"window.duckHuntSpatialAudio ? " +
+		"(window.duckHuntSpatialAudio.play(%s, %f, %f, %f, %f), true) : false"
+	) % [JSON.stringify(sound_name), x, y, viewport_size.x, viewport_size.y]
+	return bool(JavaScriptBridge.eval(expression, true))

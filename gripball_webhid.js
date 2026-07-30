@@ -36,6 +36,13 @@
   const SHAKE_MIN_RANGE = 0.15;
 
   const MAX_PLAYERS = 8;
+  const KEYBOARD_PLAYER_COUNT = 2;
+  const KEYBOARD_CONTROLS = {
+    KeyA: {player: 0, action: "track"},
+    KeyS: {player: 0, action: "shoot"},
+    KeyK: {player: 1, action: "track"},
+    KeyL: {player: 1, action: "shoot"},
+  };
 
   const TUNING_KEY = "gripball-tuning-v2";
   const HUD_KEY = "gripball-hud-hidden";
@@ -116,6 +123,8 @@
   const state = {
     players: [],
     phase: "connect",
+    keyboardMode: false,
+    keyboardHeld: {},
     readyStarted: 0,
     lastTrackEmit: 0,
     calibrationStarted: 0,
@@ -173,6 +182,7 @@
       hapticIgnoreUntil: 0,
       onInput: null,
       lastShot: 0,
+      keyboard: false,
     };
   }
 
@@ -343,10 +353,12 @@
 
   function refreshUi() {
     const startButton = document.getElementById("gripball-start");
-    if (startButton) startButton.disabled = state.players.length < 1 || state.phase !== "connect";
+    if (startButton) startButton.disabled = state.players.length < 1 || state.phase !== "connect" || state.keyboardMode;
     const connectButton = document.getElementById("gripball-connect");
+    const keyboardButton = document.getElementById("gripball-keyboard");
     if (connectButton) connectButton.style.display = state.phase === "connect" ? "" : "none";
     if (startButton) startButton.style.display = state.phase === "connect" ? "" : "none";
+    if (keyboardButton) keyboardButton.style.display = state.phase === "connect" ? "" : "none";
   }
 
   async function resumeAudioAndFocusCanvas() {
@@ -699,6 +711,54 @@
     refreshUi();
   }
 
+  async function startKeyboardTest() {
+    if (state.phase !== "connect") return;
+    await resumeAudioAndFocusCanvas();
+    state.keyboardMode = true;
+    state.players = [];
+    for (let i = 0; i < KEYBOARD_PLAYER_COUNT; i += 1) {
+      const player = makePlayer(null, i);
+      player.keyboard = true;
+      player.tracking = 0;
+      player.lastGripAt = Infinity;
+      state.players.push(player);
+    }
+    state.phase = "play";
+    state.readyStarted = performance.now();
+    emit({type: "player_count", count: state.players.length});
+    emit({type: "calibration_done"});
+    for (const player of state.players) {
+      emit({type: "track_player", player: player.playerId, value: 0});
+    }
+    setStatus("鍵盤測試：A/S 控 P1，K/L 控 P2。A/K 按住追蹤，S/L 開槍。", "ready");
+    refreshUi();
+  }
+
+  function handleKeyboard(event, pressed) {
+    if (!state.keyboardMode || state.phase !== "play") return;
+    const control = KEYBOARD_CONTROLS[event.code];
+    if (!control) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    event.preventDefault();
+    if (pressed && state.keyboardHeld[event.code]) return;
+    state.keyboardHeld[event.code] = pressed;
+    const player = state.players[control.player];
+    if (!player) return;
+    if (control.action === "track") {
+      player.tracking = pressed ? 1 : 0;
+      player.holding = pressed;
+      emit({type: "track_player", player: control.player, value: pressed ? 1 : 0});
+      return;
+    }
+    if (control.action === "shoot" && pressed) {
+      const now = performance.now();
+      if (now - player.lastShot < 140) return;
+      player.lastShot = now;
+      emit({type: "shoot_player", player: control.player});
+      setStatus(`鍵盤 P${control.player + 1} fired`, "ready");
+    }
+  }
+
   function refreshTuningUi() {
     for (const field of TUNING_FIELDS) {
       const slider = document.getElementById(`gt-${field.key}`);
@@ -773,11 +833,11 @@
 
   function installUi() {
     const style = document.createElement("style");
-    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status{cursor:pointer}#gripball-webhid button#gripball-hide{background:#0000;color:#fff9;font-size:17px;font-weight:400;line-height:1;padding:2px 4px 4px;margin-left:2px}#gripball-webhid button#gripball-hide:hover{color:#fff}#gripball-show{position:fixed;z-index:99999;right:12px;top:12px;display:none;border:0;border-radius:7px;padding:5px 9px;background:#111a;color:#fff9;font:12px system-ui;cursor:pointer}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
+    style.textContent = "#gripball-webhid{position:fixed;z-index:99999;left:50%;top:12px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;padding:8px 12px;border-radius:10px;background:#111d;color:#fff;font:14px system-ui;box-shadow:0 4px 18px #0008}#gripball-webhid button{border:0;border-radius:7px;padding:8px 13px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gripball-webhid button:disabled{opacity:.45;cursor:not-allowed}#gripball-status{cursor:pointer}#gripball-webhid button#gripball-keyboard{background:#65c7ff;color:#07121a}#gripball-webhid button#gripball-hide{background:#0000;color:#fff9;font-size:17px;font-weight:400;line-height:1;padding:2px 4px 4px;margin-left:2px}#gripball-webhid button#gripball-hide:hover{color:#fff}#gripball-show{position:fixed;z-index:99999;right:12px;top:12px;display:none;border:0;border-radius:7px;padding:5px 9px;background:#111a;color:#fff9;font:12px system-ui;cursor:pointer}#gripball-status[data-kind=error]{color:#ff9999}#gripball-status[data-kind=ready]{color:#a8f0ae}#gripball-tuning{position:fixed;z-index:99999;left:12px;bottom:12px;font:13px system-ui;color:#fff}#gripball-tuning button{border:0;border-radius:7px;padding:7px 11px;background:#f59b23;color:#15100a;font-weight:700;cursor:pointer}#gt-body{display:none;margin-top:8px;padding:10px 12px;border-radius:10px;background:#111e;box-shadow:0 4px 18px #0008;min-width:270px}#gt-body label{display:flex;align-items:center;gap:8px;margin-bottom:8px}#gt-body label span{width:64px;flex:none}#gt-body label input[type=range]{flex:1;min-width:90px}#gt-body label input[type=number]{width:66px;flex:none;padding:3px 5px;border-radius:5px;border:1px solid #555;background:#222;color:#fff;font:13px system-ui;text-align:right}#gt-body label i{width:22px;flex:none;font-style:normal;opacity:.65}#gt-import,#gt-reset{width:100%;margin-top:5px}#gt-body{min-width:330px}";
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
-    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
+    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><button id="gripball-keyboard">鍵盤測試</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
     document.body.appendChild(panel);
     const dot = document.createElement("button");
     dot.id = "gripball-show";
@@ -798,6 +858,9 @@
 
     document.getElementById("gripball-connect").addEventListener("click", addDevices);
     document.getElementById("gripball-start").addEventListener("click", startGame);
+    document.getElementById("gripball-keyboard").addEventListener("click", startKeyboardTest);
+    window.addEventListener("keydown", (event) => handleKeyboard(event, true));
+    window.addEventListener("keyup", (event) => handleKeyboard(event, false));
     installTuningUi();
     refreshUi();
     restoreAuthorizedDevices();
@@ -829,12 +892,176 @@
     });
   }
 
+  function installDuckSpatialAudio() {
+    if (window.duckHuntSpatialAudio) return;
+
+    const SOUND_URLS = {
+      quack: "assets/sfx/duck_quack.mp3",
+      scream: "assets/sfx/duck_scream.mp3",
+      drop_fall: "assets/sfx/drop_fall.mp3",
+      drop_hit: "assets/sfx/drop_hit.mp3",
+    };
+    const buffers = {};
+    let ctx = null;
+    let master = null;
+
+    function getContext() {
+      if (!ctx) {
+        ctx = window.GodotAudio && window.GodotAudio.ctx
+          ? window.GodotAudio.ctx
+          : new (window.AudioContext || window.webkitAudioContext)();
+        master = ctx.createGain();
+        master.gain.value = 0.72;
+        master.connect(ctx.destination);
+        pinListener(ctx);
+      }
+      if (ctx.state === "suspended") ctx.resume();
+      return ctx;
+    }
+
+    // We may share Godot's AudioContext, and Godot's own audio bus can move the listener.
+    // HRTF panning is relative to the listener, so a listener that has been rotated or
+    // displaced elsewhere silently skews every duck position. Pin it at the origin facing
+    // -Z (the convention connectHrtf's negative z values assume).
+    function pinListener(context) {
+      const listener = context.listener;
+      if (!listener) return;
+      const at = context.currentTime;
+      const set = (param, value) => {
+        if (!param) return false;
+        if (typeof param.setValueAtTime === "function") param.setValueAtTime(value, at);
+        else param.value = value;
+        return true;
+      };
+      const positional = set(listener.positionX, 0)
+        && set(listener.positionY, 0)
+        && set(listener.positionZ, 0);
+      if (!positional && typeof listener.setPosition === "function") {
+        listener.setPosition(0, 0, 0);
+      }
+      const oriented = set(listener.forwardX, 0)
+        && set(listener.forwardY, 0)
+        && set(listener.forwardZ, -1)
+        && set(listener.upX, 0)
+        && set(listener.upY, 1)
+        && set(listener.upZ, 0);
+      if (!oriented && typeof listener.setOrientation === "function") {
+        listener.setOrientation(0, 0, -1, 0, 1, 0);
+      }
+    }
+
+    async function loadBuffer(name) {
+      if (buffers[name]) return buffers[name];
+      const context = getContext();
+      const response = await fetch(SOUND_URLS[name]);
+      if (!response.ok) throw new Error(`Missing spatial sound ${name}`);
+      const data = await response.arrayBuffer();
+      buffers[name] = await context.decodeAudioData(data);
+      return buffers[name];
+    }
+
+    // x/y are Godot *viewport* coordinates, so the divisor has to be the game's own
+    // viewport size (vw/vh, sent by duck.gd). window.innerWidth/Height is a different
+    // coordinate space entirely: letterboxing, devicePixelRatio scaling, or a window
+    // aspect that differs from the game's design aspect all skew the mapping, which is
+    // what made the left/right placement drift. Fall back to the window only when the
+    // caller sends no viewport (older pck).
+    function sourceVector(x, y, vw, vh) {
+      const width = Math.max(1, Number(vw) || window.innerWidth || 1);
+      const height = Math.max(1, Number(vh) || window.innerHeight || 1);
+      const lateral = Math.max(-1, Math.min(1, (x / width) * 2 - 1));
+      const vertical = Math.max(-1, Math.min(1, 1 - (y / height) * 2));
+      const front = Math.max(0.18, 0.82 + vertical * 0.20);
+      const dist = Math.hypot(lateral * 0.9, vertical * 0.35);
+      return {lateral, vertical, front, dist};
+    }
+
+    function makeMonoBuffer(input) {
+      const context = getContext();
+      const inputChannels = Math.max(1, input.numberOfChannels || 1);
+      const out = context.createBuffer(1, input.length, input.sampleRate);
+      const mono = out.getChannelData(0);
+      for (let channel = 0; channel < inputChannels; channel += 1) {
+        const data = input.getChannelData(channel);
+        for (let i = 0; i < input.length; i += 1) {
+          mono[i] += data[i] / inputChannels;
+        }
+      }
+      return out;
+    }
+
+    function connectHrtf(source, vector, options) {
+      const context = getContext();
+      const panner = context.createPanner();
+      const gain = context.createGain();
+      const envelope = context.createGain();
+      panner.panningModel = "HRTF";
+      panner.distanceModel = "inverse";
+      panner.refDistance = 1;
+      panner.maxDistance = 7;
+      panner.rolloffFactor = 0.22;
+      panner.coneInnerAngle = 360;
+      panner.coneOuterAngle = 360;
+      panner.coneOuterGain = 1;
+      const x = vector.lateral * 2.9;
+      const y = vector.vertical * 0.85;
+      const z = -1.35 - Math.min(1.8, vector.dist * 0.7);
+      if (panner.positionX) {
+        panner.positionX.value = x;
+        panner.positionY.value = y;
+        panner.positionZ.value = z;
+      } else {
+        panner.setPosition(x, y, z);
+      }
+      gain.gain.value = options.gain || 0.88;
+      envelope.gain.value = 1;
+      source.connect(envelope);
+      envelope.connect(panner);
+      panner.connect(gain);
+      gain.connect(master);
+      return envelope;
+    }
+
+    async function play(name, x, y, vw, vh) {
+      try {
+        const context = getContext();
+        const buffer = await loadBuffer(name);
+        const vector = sourceVector(Number(x) || 0, Number(y) || 0, vw, vh);
+        const options = name === "drop_fall"
+          ? {gain: 0.78}
+          : {gain: name === "scream" ? 0.92 : name === "drop_hit" ? 0.9 : 0.84};
+        const source = context.createBufferSource();
+        source.buffer = makeMonoBuffer(buffer);
+        const envelope = connectHrtf(source, vector, options);
+        if (name === "drop_fall") {
+          source.playbackRate.setValueAtTime(1.55, context.currentTime);
+          source.playbackRate.exponentialRampToValueAtTime(0.34, context.currentTime + 0.38);
+          envelope.gain.setValueAtTime(1, context.currentTime);
+          envelope.gain.linearRampToValueAtTime(0.85, context.currentTime + 0.22);
+          envelope.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.55);
+          source.stop(context.currentTime + 0.58);
+        } else if (name === "scream") {
+          source.playbackRate.value = 1.04;
+        }
+        source.start();
+        return true;
+      } catch (error) {
+        console.warn("Duck HRTF spatial audio failed", error);
+        return false;
+      }
+    }
+
+    window.duckHuntSpatialAudio = {play};
+  }
+
+  installDuckSpatialAudio();
+
   window.gripballBridge = {
     poll() {
       const now = performance.now();
       if (state.phase === "play") {
         for (const player of state.players) {
-          if (player.tracking > 0 && now - player.lastGripAt > GRIP_STALE_MS) {
+          if (!player.keyboard && player.tracking > 0 && now - player.lastGripAt > GRIP_STALE_MS) {
             player.holding = false;
             player.tracking = 0;
             emit({type: "track_player", player: player.playerId, value: 0});
@@ -847,7 +1074,7 @@
         if (now - state.lastDebugAt > 200) {
           state.lastDebugAt = now;
           setStatus(
-            state.players.map((player) => {
+            state.keyboardMode ? "鍵盤測試：A/S 控 P1，K/L 控 P2。A/K 按住追蹤，S/L 開槍。" : state.players.map((player) => {
               const force = player.grip == null || player.baseline == null
                 ? 0 : Math.round(player.grip - player.baseline);
               const engage = Math.round(tuning.engageForce);

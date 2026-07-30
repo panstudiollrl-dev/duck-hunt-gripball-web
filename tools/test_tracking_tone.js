@@ -173,6 +173,28 @@ console.log("\nPitch rises as the crosshair closes on the duck");
   const spread = Math.max(...ratios) - Math.min(...ratios);
   check("steps are evenly spaced by ear (equal ratios, not equal Hz)", spread < 0.01,
         "ratios " + ratios.map((r) => r.toFixed(3)).join(","));
+
+  // Now that a press builds a fresh voice, the first update matters on its own. An unplayed
+  // OscillatorNode sits at the Web Audio default 440Hz, so gliding into the first target
+  // would swoop down from A4 at the start of every single press.
+  mod.reset();
+  mod.syncTracking([entry(0, VW / 2, VH / 2, 0)], VW, VH);
+  const fresh = mod.voices.get(0);
+  const firstPitch = fresh.carrier.frequency.events.filter((e) => e[0] !== "cancel");
+  check("a new voice's first pitch is set outright, not glided into from 440Hz",
+        firstPitch.length > 0 && firstPitch[0][0] === "set",
+        JSON.stringify(firstPitch.slice(0, 2)));
+  check("...for the modulator and its depth too, or the timbre swoops instead",
+        fresh.mod.frequency.events[0][0] === "set" &&
+        fresh.modDepth.gain.events.filter((e) => e[1] > 0)[0][0] === "set");
+  check("...but the gain still fades in, because it starts from zero and would click",
+        fresh.tone.gain.events.filter((e) => e[1] > 0)[0][0] === "target",
+        JSON.stringify(fresh.tone.gain.events));
+  mod.advance(0.05);
+  mod.syncTracking([entry(0, VW / 2, VH / 2, 0.4)], VW, VH);
+  check("the second update glides, so the sweep itself stays smooth",
+        fresh.carrier.frequency.events.slice(firstPitch.length).some((e) => e[0] === "target"),
+        JSON.stringify(fresh.carrier.frequency.events));
 }
 
 console.log("\nThe tone falls silent at lock-on, and returns when the aim drifts off");
@@ -553,6 +575,51 @@ console.log("\nBad input is ignored rather than throwing into JavaScriptBridge")
         String(pitchOf(mod.voices.get(0))));
 }
 
+console.log("\nOne press, one sweep: Godot stops sending, and the next press starts fresh");
+{
+  // Godot now ends a segment by dropping the entry from the list (an arrived crosshair stops
+  // being sent at all), and starts the next one by sending it again after release. So the
+  // JS side has to handle a voice that goes away and comes back mid-game.
+  installIndex(true);
+  mod.reset();
+  mod.syncTracking([entry(0, VW / 2, VH * 0.8, 0.2)], VW, VH);
+  const firstPress = mod.voices.get(0);
+  check("the press starts a voice", Boolean(firstPress) && gainOf(firstPress) > 0.001);
+  mod.advance(0.05);
+  mod.syncTracking([entry(0, VW / 2, VH * 0.6, 0.6)], VW, VH);
+  check("...which sweeps up while it is still being sent",
+        pitchOf(firstPress) > constant("TONE_MIN_HZ") * 1.5, pitchOf(firstPress) + "Hz");
+
+  // Arrival: Godot sends an empty list rather than locked:true.
+  mod.syncTracking([], VW, VH);
+  check("dropping the entry fades the voice out", firstPress.stopping === true);
+  check("...and releases the id, so it cannot be resumed later",
+        mod.voices.has(0) === false);
+  check("...stopping the oscillators rather than leaving them running",
+        oscsOf(firstPress).every((o) => o.stopped !== null));
+  mod.advance(0.5);
+
+  // The next press. This must be a genuinely new sweep from the bottom, not a continuation.
+  mod.syncTracking([entry(0, VW / 2, VH * 0.8, 0.2)], VW, VH);
+  const secondPress = mod.voices.get(0);
+  check("the next press builds a new voice", Boolean(secondPress) &&
+        secondPress !== firstPress);
+  check("...audible again from the start", gainOf(secondPress) > 0.001,
+        String(gainOf(secondPress)));
+  check("...starting low rather than resuming the pitch it ended on",
+        Math.abs(pitchOf(secondPress) - pitchOf(firstPress)) > 50,
+        `${Math.round(pitchOf(secondPress))}Hz vs ${Math.round(pitchOf(firstPress))}Hz`);
+  check("...and keeping the same player's timbre",
+        secondPress.timbre.ratio === firstPress.timbre.ratio &&
+        secondPress.timbre.index === firstPress.timbre.index);
+  // Repeated empty lists are the steady state while nobody is pressing, so they must be
+  // cheap and must not resurrect anything.
+  mod.syncTracking([], VW, VH);
+  mod.syncTracking([], VW, VH);
+  check("idle empty lists leave no voices behind", mod.voices.size === 0,
+        String(mod.voices.size));
+}
+
 console.log("\nThe Godot side sends what the JS side expects");
 {
   check("gripball_input.gd calls syncTracking", /duckHuntSpatialAudio\.syncTracking/.test(gd));
@@ -563,15 +630,17 @@ console.log("\nThe Godot side sends what the JS side expects");
   check("single-player tracking sends a tone", /_send_track_tones\(\[\{/.test(gd));
   check("Party Mode collects one entry per player and sends them together",
         /tones\.append\(\{/.test(gd) && /_send_track_tones\(tones\)/.test(gd));
-  check("Party Mode measures closeness to the duck, not to the wobbled chase point",
+  check("Party Mode measures closeness to the duck itself",
         /_closeness_to\(current, target\)/.test(gd));
+  check("the crosshair wobble is gone entirely",
+        !/wobble/i.test(gd), (gd.match(/.*wobble.*/i) || [""])[0].trim());
   check("tracking stops are sent as an empty list",
         (gd.match(/_send_track_tones\(\[\]\)/g) || []).length >= 2,
         String((gd.match(/_send_track_tones\(\[\]\)/g) || []).length));
   check("updates are throttled, but far faster than the 0.22s proximity feedback",
         /TRACK_TONE_INTERVAL := 1\.0 \/ 30\.0/.test(gd));
-  check("single player reports lock from the duck's real hitbox",
-        /"locked": _is_on_duck\(virtual_position, duck\)/.test(gd));
+  check("single player ends the tone from the duck's real hitbox",
+        /if _is_on_duck\(virtual_position, duck\):\s*\n\s*tone_spent = true/.test(gd));
   check("_is_on_duck uses the same geometry as the shot test",
         /func _is_on_duck/.test(gd) &&
         /collision\.shape\.get_rect\(\)\.has_point\(collision\.to_local\(point\)\)/.test(gd));
@@ -580,8 +649,51 @@ console.log("\nThe Godot side sends what the JS side expects");
           .test(gd));
   check("a missing or unpickable duck counts as not locked",
         /func _is_on_duck[\s\S]*?input_pickable[\s\S]*?return false/.test(gd));
-  check("Party Mode reports lock too (by radius, having only a position to work from)",
-        /"locked": current\.distance_to\(target\) <= TRACK_LOCK_RADIUS/.test(gd));
+  check("Party Mode ends the tone too (by radius, having only a position to work from)",
+        /distance_to\(target\) <= TRACK_LOCK_RADIUS:\s*\n\s*party_tone_spent\[player_id\] = true/
+          .test(gd));
+
+  // One press -> one sweep. The flag has to be set on arrival and cleared ONLY on release;
+  // anything else clearing it (a new duck, a frame tick) would let a single hold re-trigger.
+  check("the spent flags are declared before use",
+        /var tone_spent := false/.test(gd) && /var party_tone_spent := \{\}/.test(gd));
+  check("single player re-arms on release, and only on release",
+        /if tracking_strength <= TRACK_PRESS_FLOOR:[\s\S]{0,220}?tone_spent = false/.test(gd) &&
+        (gd.match(/\btone_spent = false/g) || []).length === 1,
+        String((gd.match(/\btone_spent = false/g) || []).length) + " reset site(s)");
+  // Ordering matters as much as the flag: if the arrival test ran while released, the flag
+  // would be re-armed the instant the next press began (the crosshair is still parked on the
+  // duck from last time) and that press would be silent. Both modes must leave the loop
+  // before testing arrival - single player by returning, Party Mode by continuing.
+  // Matched on the release branch's own body (comments and indented statements only, no
+  // blank line and no dedent), so a `return` anywhere further down the function cannot
+  // stand in for the one that has to be right here.
+  const releaseBody = (gd.match(
+    /if tracking_strength <= TRACK_PRESS_FLOOR:\n((?:\t\t(?:#.*|\S.*)\n)+)/
+  ) || [])[1] || "";
+  check("the release branch returns, so the arrival test cannot re-arm it",
+        /^\t\treturn$/m.test(releaseBody), JSON.stringify(releaseBody));
+  const partyReleaseBody = (gd.match(
+    /if strength <= TRACK_PRESS_FLOOR:\n((?:\t\t\t(?:#.*|\S.*)\n)+)/
+  ) || [])[1] || "";
+  check("...and Party Mode's release branch continues, for the same reason",
+        /^\t\t\tcontinue$/m.test(partyReleaseBody), JSON.stringify(partyReleaseBody));
+  check("Party Mode re-arms per player on release",
+        /if strength <= TRACK_PRESS_FLOOR:[\s\S]{0,260}?party_tone_spent\[player_id\] = false/
+          .test(gd));
+  check("a spent press sends silence rather than a tone",
+        /if tone_spent:\n(?:\s*#.*\n)*\s*_send_track_tones\(\[\]\)/.test(gd) &&
+        /if not bool\(party_tone_spent\.get\(player_id, false\)\):/.test(gd));
+  check("party spent flags are cleared when the crosshairs are rebuilt",
+        /func _setup_party_crosshairs[\s\S]*?party_tone_spent\.clear\(\)/.test(gd));
+  check("release is the same threshold the crosshair texture already switches on",
+        /const TRACK_PRESS_FLOOR := 0\.01/.test(gd) &&
+        /strength > 0\.01 else crosshair_white/.test(gd));
+  // The tone now stops on arrival rather than being ducked to silence, so nothing should be
+  // sending locked:true any more - it would double up with the press gate.
+  check("no live entry claims locked, now that arrival ends the segment instead",
+        !/"locked": (?!false)/.test(gd),
+        (gd.match(/"locked": .*/g) || []).join(" | "));
   check("the disabled haptics path was not re-enabled",
         !/gripballBridge\.proximity/.test(gd) || /web_mode/.test(gd));
 

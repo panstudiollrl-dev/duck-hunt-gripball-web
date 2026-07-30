@@ -1677,21 +1677,31 @@
       const context = voice.context;
       const now = context.currentTime;
       const glide = TONE_GLIDE_MS / 1000;
-      if (!voice.started) {
+      // A brand new oscillator sits at the Web Audio default 440Hz, so gliding into the
+      // first target would swoop down from A4 every time a press starts a voice - audible,
+      // because the gain fades in over the same time constant rather than hiding it. So the
+      // first update sets pitch outright and only later ones glide. The gain still fades:
+      // that one wants smoothing precisely because it is starting from zero.
+      const first = !voice.started;
+      if (first) {
         voice.carrier.start();
         voice.mod.start();
         voice.started = true;
       }
+      const setPitch = (param, value) => {
+        if (first) param.setValueAtTime(value, now);
+        else param.setTargetAtTime(value, now, glide);
+      };
       // Pitch in semitones rather than Hz, so the rise sounds evenly paced rather than
       // bunched up at the bottom.
       const octaves = Math.log2(TONE_MAX_HZ / TONE_MIN_HZ);
       const hz = TONE_MIN_HZ * Math.pow(2, octaves * Math.max(0, Math.min(1, closeness)));
-      voice.carrier.frequency.setTargetAtTime(hz, now, glide);
+      setPitch(voice.carrier.frequency, hz);
       // Modulator tracks the carrier so the timbre stays put as the pitch sweeps, and the
       // depth is index * modulator frequency (the standard FM definition of index).
       const modHz = hz * voice.timbre.ratio;
-      voice.mod.frequency.setTargetAtTime(modHz, now, glide);
-      voice.modDepth.gain.setTargetAtTime(modHz * voice.timbre.index, now, glide);
+      setPitch(voice.mod.frequency, modHz);
+      setPitch(voice.modDepth.gain, modHz * voice.timbre.index);
       // Swell a little as it closes in, so the cue reads even at a glance-level of
       // attention, but never loud enough to fight the quacks - then duck out entirely at
       // lock-on. The lock-out uses its own short time constant: the swell wants to be
@@ -1805,7 +1815,23 @@
       };
     }
 
-    window.duckHuntSpatialAudio = {play, syncTracking, stopAllTracking, debugVoice};
+    // Browsers only start an AudioContext from inside a user gesture, and ctx.resume() is
+    // async - a caller that kicks off audio from a later frame gets a context that stays
+    // suspended, which looks exactly like a broken graph (correct gain, no sound). Callers
+    // that own the gesture (tone_bench.html) await this from the click handler itself.
+    async function resumeAudio() {
+      const context = getContext();
+      if (context.state === "suspended") {
+        try { await context.resume(); } catch (error) {
+          console.warn("Could not resume audio", error);
+        }
+      }
+      return {state: context.state, sampleRate: context.sampleRate};
+    }
+
+    window.duckHuntSpatialAudio = {
+      play, syncTracking, stopAllTracking, debugVoice, resumeAudio,
+    };
 
     // Needs a live AudioContext to decode into, so it can only run after a user gesture.
     // Kick it off on the first interaction and let it finish in the background.

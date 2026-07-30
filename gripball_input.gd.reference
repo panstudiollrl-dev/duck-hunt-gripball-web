@@ -10,8 +10,6 @@ const TRACK_SPEED_MIN := 45.0
 const TRACK_SPEED_MAX := 300.0
 const PARTY_TRACK_SPEED_MIN := 55.0
 const PARTY_TRACK_SPEED_MAX := 255.0
-const PARTY_WOBBLE_MIN := 10.0
-const PARTY_WOBBLE_MAX := 42.0
 # The aim-tracking tone is a continuous pitch bend, so it needs updates far more often than
 # the 0.22s proximity feedback - at that rate the pitch would move in audible steps. 30Hz is
 # frequent enough to sound continuous once the JS side smooths between updates, without
@@ -22,10 +20,12 @@ const TRACK_TONE_INTERVAL := 1.0 / 30.0
 const TRACK_TONE_RANGE := 0.65
 # Party Mode's targets arrive as bare positions (_get_gripball_player_target returns a
 # Vector2), so there is no hitbox to test against the way single player does. This radius
-# stands in for one: it is a little wider than the duck's own collision circle, which suits
-# Party Mode anyway - the crosshair there wobbles on purpose, so an exact-to-the-pixel lock
-# would flicker the tone on and off as the wobble crosses the edge.
+# stands in for one: it is a little wider than the duck's own collision circle, so a
+# crosshair that has visibly arrived counts as arrived even if it is a pixel or two off.
 const TRACK_LOCK_RADIUS := 22.0
+# Below this the grip counts as released, which is what ends a tone segment and arms the
+# next one. Same threshold the crosshair texture already switches on.
+const TRACK_PRESS_FLOOR := 0.01
 var udp := PacketPeerUDP.new()
 var feedback_udp := PacketPeerUDP.new()
 var virtual_position := Vector2.ZERO
@@ -39,7 +39,10 @@ var player_count := 0
 var party_crosshairs := {}
 var party_positions := {}
 var party_strengths := {}
-var party_wobble_phase := {}
+# One flag per player: has this press already reached the duck? Set on arrival, cleared on
+# release. While set, the player emits no tone - the reward for arriving is silence, and the
+# next press is what buys a new sweep.
+var party_tone_spent := {}
 var party_layer: CanvasLayer
 var status_label: Label
 var step_label: Label
@@ -49,6 +52,7 @@ var value_label: Label
 var last_feedback_time := 0.0
 var last_track_tone_time := 0.0
 var track_tone_active := false
+var tone_spent := false
 var web_mode := false
 
 
@@ -207,7 +211,7 @@ func _setup_party_crosshairs(count: int) -> void:
 	party_crosshairs.clear()
 	party_positions.clear()
 	party_strengths.clear()
-	party_wobble_phase.clear()
+	party_tone_spent.clear()
 	var size := get_viewport().get_visible_rect().size
 	for player_id in range(count):
 		var sprite := Sprite2D.new()
@@ -222,7 +226,7 @@ func _setup_party_crosshairs(count: int) -> void:
 		sprite.position = position
 		party_positions[player_id] = position
 		party_strengths[player_id] = 0.0
-		party_wobble_phase[player_id] = randf() * TAU
+		party_tone_spent[player_id] = false
 		party_layer.add_child(sprite)
 		party_crosshairs[player_id] = sprite
 		var label := Label.new()
@@ -305,7 +309,10 @@ func _update_tracking(delta: float) -> void:
 	if party_mode:
 		_update_party_tracking(delta)
 		return
-	if tracking_strength <= 0.01:
+	if tracking_strength <= TRACK_PRESS_FLOOR:
+		# Released: arm the next press. Nothing else clears this flag, so one press can only
+		# ever produce one sweep no matter how long it is held.
+		tone_spent = false
 		_send_track_tones([])
 		return
 	var duck := get_tree().current_scene.find_child("Duck", true, false)
@@ -318,15 +325,23 @@ func _update_tracking(delta: float) -> void:
 	virtual_position = virtual_position.move_toward(target, speed * delta)
 	crosshair.position = virtual_position
 	var closeness := _closeness_to(virtual_position, target)
-	_send_track_tones([{
-		"id": 0,
-		"x": virtual_position.x,
-		"y": virtual_position.y,
-		"closeness": closeness,
-		# Uses the duck's real hitbox, the same test _try_hit_duck() does, so the tone going
-		# silent means exactly "a shot right now would land" rather than "quite close".
-		"locked": _is_on_duck(virtual_position, duck),
-	}])
+	# Uses the duck's real hitbox, the same test _try_hit_duck() does, so the tone ending
+	# means exactly "a shot right now would land" rather than "quite close".
+	if _is_on_duck(virtual_position, duck):
+		tone_spent = true
+	if tone_spent:
+		# Arrived earlier in this same press. Staying silent is the point: the sweep is the
+		# sound of closing in, and tracking assist parks the crosshair on the duck, so a tone
+		# that resumed here would just drone for the rest of the hold.
+		_send_track_tones([])
+	else:
+		_send_track_tones([{
+			"id": 0,
+			"x": virtual_position.x,
+			"y": virtual_position.y,
+			"closeness": closeness,
+			"locked": false,
+		}])
 	var now := Time.get_ticks_msec() / 1000.0
 	if now - last_feedback_time >= 0.22:
 		var intensity := roundi(20.0 + closeness * 75.0)
@@ -355,7 +370,10 @@ func _update_party_tracking(delta: float) -> void:
 		var sprite: Sprite2D = party_crosshairs[player_id]
 		var strength := float(party_strengths.get(player_id, 0.0))
 		var current: Vector2 = party_positions.get(player_id, sprite.position)
-		if strength <= 0.01:
+		if strength <= TRACK_PRESS_FLOOR:
+			# Released: arm this player's next press. Per player, so one player letting go
+			# does not re-arm anybody else.
+			party_tone_spent[player_id] = false
 			party_positions[player_id] = current
 			sprite.position = current
 			continue
@@ -368,31 +386,21 @@ func _update_party_tracking(delta: float) -> void:
 				has_target = true
 		if not has_target:
 			continue
-		var to_target := target - current
-		var distance := to_target.length()
-		var direction := to_target.normalized() if distance > 0.001 else Vector2.ZERO
-		var perpendicular := Vector2(-direction.y, direction.x)
-		var phase := float(party_wobble_phase.get(player_id, 0.0)) + delta * lerpf(2.4, 6.5, strength)
-		party_wobble_phase[player_id] = phase
-		var wobble_size := lerpf(PARTY_WOBBLE_MAX, PARTY_WOBBLE_MIN, strength)
-		wobble_size *= clampf(distance / 160.0, 0.30, 1.0)
-		var wobble := perpendicular * sin(phase) * wobble_size
-		wobble += direction.rotated(0.65) * sin(phase * 0.53 + player_id) * wobble_size * 0.45
-		var chase_target := target + wobble
 		var speed := lerpf(PARTY_TRACK_SPEED_MIN, PARTY_TRACK_SPEED_MAX, strength)
-		current = current.move_toward(chase_target, speed * delta)
+		current = current.move_toward(target, speed * delta)
 		current = current.clamp(Vector2.ZERO, viewport_size)
 		party_positions[player_id] = current
 		sprite.position = current
-		# Closeness to the real target, not to the wobbled chase point: the tone should report
-		# how well aimed the player is, not the deliberate unsteadiness added to the crosshair.
-		tones.append({
-			"id": player_id,
-			"x": current.x,
-			"y": current.y,
-			"closeness": _closeness_to(current, target),
-			"locked": current.distance_to(target) <= TRACK_LOCK_RADIUS,
-		})
+		if current.distance_to(target) <= TRACK_LOCK_RADIUS:
+			party_tone_spent[player_id] = true
+		if not bool(party_tone_spent.get(player_id, false)):
+			tones.append({
+				"id": player_id,
+				"x": current.x,
+				"y": current.y,
+				"closeness": _closeness_to(current, target),
+				"locked": false,
+			})
 	_send_track_tones(tones)
 
 

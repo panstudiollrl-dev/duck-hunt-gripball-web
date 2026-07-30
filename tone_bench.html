@@ -40,7 +40,9 @@
     <div id="stage"><div id="duck"></div><div id="hair"></div></div>
     <p class="note" style="margin-top:10px">
       滑鼠移到框內就是準心（畫面比例已換算成遊戲的 256×240）。<br>
-      <b>先按下面的「開始發聲」</b> —— 瀏覽器要有一次點擊才准開音訊。
+      <b>1.</b> 先按右邊的「開始發聲」—— 瀏覽器要有一次點擊才准開音訊。<br>
+      <b>2.</b> 然後在框裡<b>按住滑鼠</b>當作握住握力球，準心會自己被拉向鴨子，
+      碰到就是一段結束。放開再按下一段。
     </p>
   </div>
 
@@ -50,8 +52,10 @@
       <button id="stop" class="alt">停止</button>
     </div>
     <div class="readout" style="margin-top:12px">
+      <div><span>AudioContext</span><b id="r-state">尚未開啟</b></div>
       <div><span>距離</span><b id="r-dist">–</b></div>
       <div><span>closeness</span><b id="r-clos">–</b></div>
+      <div><span>按壓</span><b id="r-press">放開</b></div>
       <div><span>locked（在 hitbox 內）</span><b id="r-lock">–</b></div>
       <div><span>音高</span><b id="r-hz">–</b></div>
       <div><span>音量（實際送到 gain）</span><b id="r-gain">–</b></div>
@@ -70,9 +74,12 @@
       <b id="lockr-v" style="width:42px;text-align:right">22px</b>
     </label>
     <label><span>鴨子會動</span><input id="move" type="checkbox"></label>
+    <label><span>一按一段</span><input id="gate" type="checkbox" checked></label>
     <p class="note">
-      lock 半徑拉到 <b>0</b> 就是完全關掉「對準即靜音」，可以單獨聽音高與空間感。
-      這個測試台只驗證音訊；遊戲裡的判定是 Godot 的 hitbox。
+      <b>「一按一段」勾著的時候，要在框裡按住滑鼠才有聲音</b> —— 這就是遊戲裡的行為：
+      按壓開始發聲、碰到鴨子就結束，放開重按才有下一段。<br>
+      取消勾選會變成一直發聲（lock 半徑再拉到 <b>0</b> 就完全不靜音），
+      方便單獨聽音高和空間感。這個測試台只驗證音訊；遊戲裡的判定是 Godot 的 hitbox。
     </p>
   </div>
 </div>
@@ -109,6 +116,24 @@
     place();
   });
 
+  // The press is the mouse button, standing in for squeezing the grip ball. tone_spent
+  // mirrors gripball_input.gd: set on arrival, cleared only on release.
+  let pressed = false;
+  let toneSpent = false;
+  stage.addEventListener("pointerdown", () => {
+    pressed = true;
+    toneSpent = false;
+    el("r-press").textContent = "按住";
+  });
+  const release = () => {
+    if (!pressed) return;
+    pressed = false;
+    toneSpent = false;
+    el("r-press").textContent = "放開";
+  };
+  window.addEventListener("pointerup", release);
+  window.addEventListener("pointercancel", release);
+
   el("lockr").addEventListener("input", () => {
     el("lockr-v").textContent = el("lockr").value + "px";
   });
@@ -128,32 +153,79 @@
       place();
     }
 
+    const gated = el("gate").checked;
+    // While pressed the game pulls the crosshair toward the duck (TRACK_SPEED_MIN..MAX in
+    // gripball_input.gd); without that the press would never arrive on its own.
+    if (gated && pressed) {
+      const toDuck = Math.hypot(duck.x - hair.x, duck.y - hair.y);
+      const step = 170 * dt;
+      if (toDuck > step && toDuck > 0) {
+        hair.x += (duck.x - hair.x) / toDuck * step;
+        hair.y += (duck.y - hair.y) / toDuck * step;
+      } else {
+        hair.x = duck.x;
+        hair.y = duck.y;
+      }
+      place();
+    }
+
     const dist = Math.hypot(duck.x - hair.x, duck.y - hair.y);
     const closeness = 1 - Math.min(dist / (DIAG * TRACK_TONE_RANGE), 1);
     const lockRadius = Number(el("lockr").value);
     const locked = lockRadius > 0 && dist <= lockRadius;
     const id = Number(el("pid").value);
 
-    window.duckHuntSpatialAudio.syncTracking(
-      [{id, x: hair.x, y: hair.y, closeness, locked}], VW, VH
-    );
+    if (gated) {
+      // Only while pressed, mirroring gripball_input.gd, whose release branch returns before
+      // the hitbox test. Checking it while released would re-arm the flag the moment the next
+      // press begins (the crosshair is still parked on the duck), and that press would be
+      // silent - the exact symptom this bench exists to rule out.
+      if (pressed && locked) toneSpent = true;
+      // Exactly what Godot does: an arrived or unpressed crosshair is simply not sent, and
+      // the JS side fades out any id missing from the list.
+      const sounding = pressed && !toneSpent;
+      window.duckHuntSpatialAudio.syncTracking(
+        sounding ? [{id, x: hair.x, y: hair.y, closeness, locked: false}] : [], VW, VH
+      );
+    } else {
+      window.duckHuntSpatialAudio.syncTracking(
+        [{id, x: hair.x, y: hair.y, closeness, locked}], VW, VH
+      );
+    }
 
-    duckEl.classList.toggle("locked", locked);
+    duckEl.classList.toggle("locked", gated ? toneSpent : locked);
     el("r-dist").textContent = dist.toFixed(1) + "px";
     el("r-clos").textContent = closeness.toFixed(3);
-    el("r-lock").textContent = locked ? "是（靜音）" : "否";
+    el("r-lock").textContent = gated
+      ? (toneSpent ? "已抵達（這段結束，放開重按）" : (pressed ? "追蹤中" : "等待按壓"))
+      : (locked ? "是（靜音）" : "否");
     const probe = window.duckHuntSpatialAudio.debugVoice
       ? window.duckHuntSpatialAudio.debugVoice(id) : null;
+    // No voice at all once a segment has ended - it is stopped and dropped, not muted.
     if (probe) {
       el("r-hz").textContent = Math.round(probe.hz) + " Hz";
       el("r-gain").textContent = probe.gain.toFixed(4);
       el("r-bar").style.width = Math.min(100, probe.gain / 0.16 * 100) + "%";
+    } else {
+      el("r-hz").textContent = "–";
+      el("r-gain").textContent = "0（沒有 voice）";
+      el("r-bar").style.width = "0";
     }
     requestAnimationFrame(frame);
   }
 
-  el("go").addEventListener("click", () => {
+  // The AudioContext has to be created and resumed *inside* the click handler. Doing it a
+  // frame later (from requestAnimationFrame) is outside the user gesture, and Chrome leaves
+  // the context suspended - the whole graph runs, reports sensible gain, and makes no sound.
+  el("go").addEventListener("click", async () => {
     if (running) return;
+    const probe = window.duckHuntSpatialAudio.resumeAudio
+      ? await window.duckHuntSpatialAudio.resumeAudio() : null;
+    el("r-state").textContent = probe ? probe.state : "?";
+    if (probe && probe.state !== "running") {
+      el("r-state").textContent = probe.state + "（沒開起來，再按一次）";
+      return;
+    }
     running = true;
     last = null;
     requestAnimationFrame(frame);

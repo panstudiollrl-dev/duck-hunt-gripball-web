@@ -91,6 +91,14 @@
   // this waits for the stream rather than failing outright.
   const QUICK_WAKE_MS = 12000;
 
+  // Auto-start (Pan, 2026-07-30): once balls are connected there is nothing left to ask, so
+  // do not make anyone press 開始遊戲. Connecting is now the only deliberate action.
+  //
+  // The delay exists because players connect one ball at a time: two Gripballs are two separate
+  // enrolments a second or two apart, and starting on the first would leave the second player
+  // out of the game. Every new enrolment restarts this timer, so the window is "no new ball for
+  // AUTO_START_QUIET_MS", not a fixed deadline from the first one.
+  const AUTO_START_QUIET_MS = 2500;
   const SHAKE_REST_MS = 900;
   const SHAKE_SAMPLE_MS = 2500;
   const SHAKE_FIRE_RATIO = 0.45;
@@ -202,6 +210,8 @@
     lastTrackEmit: 0,
     calibrationStarted: 0,
     lastDebugAt: 0,
+    // A start that failed leaves the retry button on screen even if the row is set to hidden.
+    startFailed: false,
   };
 
   function emit(message) {
@@ -306,12 +316,18 @@
   function setConnectedStatus(prefix = "已連接") {
     if (state.players.length > 0) {
       setStatus(
-        `${prefix} ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}`).join(" / ")}。可繼續新增或開始。`,
+        `${prefix} ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}`).join(" / ")}。` +
+        (state.phase === "connect" && !state.keyboardMode
+          ? `拿好球，馬上開始…（要多加一顆就現在按「連接/新增握力球」）`
+          : `可繼續新增或開始。`),
         "waiting"
       );
     } else {
       setStatus("尚未偵測到已授權握力球。若 Chrome 視窗出現 paired，仍需選取一次授權給這個網頁。", "waiting");
     }
+    // The countdown restarts on every connect and disconnect, so adding a second ball keeps it
+    // in the same game, and unplugging the last one stops a start with nobody in it.
+    scheduleAutoStart();
     refreshUi();
   }
 
@@ -436,6 +452,17 @@
     }
   }
 
+  /**
+   * True while a button is the only way forward, i.e. nothing is connected yet so nothing can
+   * auto-start. Hiding the row in that state left the page looking like it did nothing at all,
+   * with the way back buried behind a small button labelled 「數值」 - which reads as a
+   * diagnostics toggle, not as "your only control is in here".
+   */
+  function needsButtons() {
+    if (state.startFailed) return true;   // the retry button is in the row, so show the row
+    return state.phase === "connect" && !state.keyboardMode && state.players.length < 1;
+  }
+
   function refreshUi() {
     const startButton = document.getElementById("gripball-start");
     const calibrateButton = document.getElementById("gripball-calibrate");
@@ -448,6 +475,45 @@
     if (startButton) startButton.style.display = state.phase === "connect" ? "" : "none";
     if (calibrateButton) calibrateButton.style.display = state.phase === "connect" ? "" : "none";
     if (keyboardButton) keyboardButton.style.display = state.phase === "connect" ? "" : "none";
+    // The row shows itself whenever it holds the only way forward, whatever the saved
+    // preference says. The preference is remembered, not lost: applyHudVisibility() honours it
+    // again as soon as the buttons are no longer needed.
+    applyHudVisibility();
+  }
+
+  function audioIsBlocked() {
+    const ctx = window.GodotAudio && window.GodotAudio.ctx;
+    return Boolean(ctx) && ctx.state === "suspended";
+  }
+
+  /**
+   * Auto-start removed the one guaranteed user gesture this page had.
+   *
+   * Browsers only let an AudioContext start from inside a gesture, and pressing the ball is a
+   * HID event, not a gesture - so it can never unlock audio by itself. For a returning player
+   * the balls are already authorized, restoreAuthorizedDevices() enrols them with no click at
+   * all, and the game can now reach play having never seen one: correct graph, no sound.
+   *
+   * So resume from the first real click or keypress anywhere on the page, once. Capture phase
+   * and passive, so it cannot interfere with the game's own input handling.
+   */
+  function unlockAudioOnFirstGesture() {
+    const events = ["pointerdown", "keydown", "touchstart"];
+    const unlock = () => {
+      const ctx = window.GodotAudio && window.GodotAudio.ctx;
+      if (ctx && ctx.state === "suspended") {
+        Promise.resolve(ctx.resume()).catch((error) =>
+          console.warn("Could not resume audio on gesture", error));
+      }
+      // Only stop listening once there is a context and it is running; the first click can
+      // easily land before Godot has created one.
+      if (ctx && ctx.state === "running") {
+        for (const name of events) window.removeEventListener(name, unlock, true);
+      }
+    };
+    for (const name of events) {
+      window.addEventListener(name, unlock, {capture: true, passive: true});
+    }
   }
 
   async function resumeAudioAndFocusCanvas() {
@@ -1064,12 +1130,51 @@
     refreshTuningUi();
   }
 
+  // ---------------------------------------------------------------------------------
+  // Auto-start. Connecting a ball is the only thing a player has to do; the game starts
+  // itself once the balls stop arriving.
+  let autoStartTimer = null;
+  let starting = false;
+
+  function cancelAutoStart() {
+    if (autoStartTimer == null) return;
+    clearTimeout(autoStartTimer);
+    autoStartTimer = null;
+  }
+
+  /**
+   * Arm (or re-arm) the auto-start countdown. Called after every enrolment, so connecting a
+   * second ball pushes the start back and it joins the same game rather than being left out.
+   */
+  function scheduleAutoStart() {
+    cancelAutoStart();
+    // Not in keyboard test, not once we have already left the connect phase, and not with
+    // nothing connected. refreshUi() shows the countdown so it never looks like a hang.
+    if (state.keyboardMode || state.phase !== "connect" || state.players.length < 1) return;
+    autoStartTimer = setTimeout(() => {
+      autoStartTimer = null;
+      // Re-check: a ball can disconnect, or the player can hit 鍵盤測試/開始遊戲, during the wait.
+      if (state.keyboardMode || state.phase !== "connect" || state.players.length < 1) return;
+      startGame(false);
+    }, AUTO_START_QUIET_MS);
+    refreshUi();
+  }
+
   /**
    * @param {boolean} withCalibration Run the old three-round sequence. Default is not to:
    *   a fixed threshold needs only a zero, so the normal path just takes one and starts.
    */
   async function startGame(withCalibration) {
     if (state.players.length < 1 || state.phase !== "connect") return;
+    // The phase check above is not enough on its own: phase only changes after the first
+    // await, so an auto-start and an impatient click on 開始遊戲 could both get past it and
+    // run two starts at once. Now that starting is not always a deliberate press, that race
+    // is reachable in normal play.
+    if (starting) return;
+    starting = true;
+    state.startFailed = false;
+    // Whoever gets here first wins; a pending timer must not fire a second start on top.
+    cancelAutoStart();
     try {
       await resumeAudioAndFocusCanvas();
       if (withCalibration) {
@@ -1089,24 +1194,42 @@
       for (const player of state.players) {
         emit({type: "track_player", player: player.playerId, value: Math.max(0, player.tracking)});
       }
-      setStatus(`開始！握住追蹤鴨子，甩動才發射。`, "ready");
+      // Auto-start can reach here without a single click, in which case the browser still has
+      // audio suspended and nothing will be audible until the player touches the page. Say so,
+      // rather than leaving a silent game looking broken.
+      setStatus(
+        audioIsBlocked()
+          ? `開始！握住追蹤鴨子，甩動才發射。（點一下畫面開聲音）`
+          : `開始！握住追蹤鴨子，甩動才發射。`,
+        "ready"
+      );
     } catch (error) {
       console.error(error);
       state.phase = "connect";
+      // A failed auto-start must leave the buttons usable, and must not immediately re-arm the
+      // countdown - retrying every 2.5s forever would bury the error message. So the HUD is
+      // revealed instead and the next press is the player's.
       setStatus(
         withCalibration
           ? `校正失敗：${error.message || error}。請放開握力球後再開始。`
-          : `無法開始：${error.message || error}`,
+          : `無法自動開始：${error.message || error}。請按「開始遊戲」重試。`,
         "error"
       );
+      // Reveals the row via needsButtons() without overwriting the saved preference, so hiding
+      // it stays hidden next session.
+      state.startFailed = true;
     }
+    starting = false;
     refreshUi();
   }
 
   async function startKeyboardTest() {
     if (state.phase !== "connect") return;
-    await resumeAudioAndFocusCanvas();
+    // Before the await, so a countdown that is already pending cannot start a ball game
+    // underneath the keyboard test while resumeAudioAndFocusCanvas() is in flight.
+    cancelAutoStart();
     state.keyboardMode = true;
+    await resumeAudioAndFocusCanvas();
     state.players = [];
     for (let i = 0; i < KEYBOARD_PLAYER_COUNT; i += 1) {
       const player = makePlayer(null, i);
@@ -1211,11 +1334,22 @@
     refreshTuningUi();
   }
 
-  function setHudHidden(hidden) {
+  // What the player last chose, which is not the same thing as what is on screen: while the
+  // buttons are the only way forward the row is shown regardless, then this takes over again.
+  let hudHiddenPreference = false;
+
+  function applyHudVisibility() {
+    const hidden = hudHiddenPreference && !needsButtons();
     const panel = document.getElementById("gripball-webhid");
     const dot = document.getElementById("gripball-show");
     if (panel) panel.style.display = hidden ? "none" : "flex";
+    // The 「數值」 button is the way back in, so it has no reason to exist while the row is up.
     if (dot) dot.style.display = hidden ? "block" : "none";
+  }
+
+  function setHudHidden(hidden) {
+    hudHiddenPreference = hidden;
+    applyHudVisibility();
     try {
       window.localStorage.setItem(HUD_KEY, hidden ? "1" : "0");
     } catch (error) {
@@ -1233,8 +1367,10 @@
     document.body.appendChild(panel);
     const dot = document.createElement("button");
     dot.id = "gripball-show";
-    dot.textContent = "數值";
-    dot.title = "顯示即時數值";
+    // "數值" read as a diagnostics toggle, so the connect/start buttons behind it were not
+    // findable. This says what is actually in there.
+    dot.textContent = "握力球選單";
+    dot.title = "顯示握力球控制列（連接、開始、鍵盤測試、即時數值）";
     document.body.appendChild(dot);
     dot.addEventListener("click", () => setHudHidden(false));
     document.getElementById("gripball-hide").addEventListener("click", (event) => {
@@ -1242,10 +1378,12 @@
       setHudHidden(true);
     });
     document.getElementById("gripball-status").addEventListener("click", () => setHudHidden(true));
+    // Load the preference without writing it back, then let refreshUi() below decide what is
+    // actually shown - at boot nothing is connected, so the row wins over a saved "hidden".
     try {
-      setHudHidden(window.localStorage.getItem(HUD_KEY) === "1");
+      hudHiddenPreference = window.localStorage.getItem(HUD_KEY) === "1";
     } catch (error) {
-      setHudHidden(false);
+      hudHiddenPreference = false;
     }
 
     document.getElementById("gripball-connect").addEventListener("click", addDevices);
@@ -1259,6 +1397,7 @@
     window.addEventListener("keydown", (event) => handleKeyboard(event, true));
     window.addEventListener("keyup", (event) => handleKeyboard(event, false));
     installTuningUi();
+    unlockAudioOnFirstGesture();
     refreshUi();
     restoreAuthorizedDevices();
   }

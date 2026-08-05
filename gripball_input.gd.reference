@@ -3,6 +3,9 @@ extends Node
 signal calibration_finished
 signal players_changed(count: int)
 signal player_shot(player_id: int)
+# Emitted the first time a given ball produces a press big enough to count as one. Enrolment
+# alone does not prove a ball works: it can be authorized, streaming, and still never engage.
+signal player_proven(player_id: int)
 
 const PORT := 8001
 const FEEDBACK_PORT := 8002
@@ -39,6 +42,9 @@ var player_count := 0
 var party_crosshairs := {}
 var party_positions := {}
 var party_strengths := {}
+# player_id -> true once that ball has been seen to press. Read by main.gd's intro screen so it
+# only waits on players who can actually shoot.
+var players_proven := {}
 # One flag per player: has this press already reached the duck? Set on arrival, cleared on
 # release. While set, the player emits no tone - the reward for arriving is silence, and the
 # next press is what buys a new sweep.
@@ -121,6 +127,11 @@ func _handle_message(message: Variant) -> void:
 		crosshair.hide()
 		if new_player_count != player_count or party_crosshairs.is_empty():
 			player_count = new_player_count
+			# The JS side re-indexes players whenever one connects or disconnects, so after a
+			# count change a stored player_id refers to a different ball. Keeping the old flags
+			# would credit a new ball with a proven-ness it has not earned, so they are dropped
+			# and each ball proves itself again on its next press.
+			players_proven.clear()
 			_setup_party_crosshairs(player_count)
 			players_changed.emit(player_count)
 	elif message.get("type") == "shoot_player":
@@ -133,6 +144,15 @@ func _handle_message(message: Variant) -> void:
 		else:
 			_send_click(true)
 			_send_click(false)
+	elif message.get("type") == "player_proven":
+		# This ball has produced a real press for the first time. Only now is it known to be a
+		# working controller rather than just an enrolled device - see the intro screen, which
+		# would otherwise wait forever for a ball that cannot engage.
+		party_mode = true
+		var proven_id := maxi(int(message.get("player", 0)), 0)
+		if not players_proven.has(proven_id):
+			players_proven[proven_id] = true
+			player_proven.emit(proven_id)
 	elif message.get("type") == "track_player":
 		party_mode = true
 		var track_player_id := maxi(int(message.get("player", 0)), 0)

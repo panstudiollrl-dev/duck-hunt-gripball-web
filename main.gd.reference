@@ -67,6 +67,14 @@ var highscore_screen
 var party_ducks := {}
 var intro_party_ducks := {}
 var intro_players_hit := {}
+# Set once the intro screen has been left, by whichever route got there first. Guards against a
+# second intro_screen_continued landing in the started game.
+var intro_continue_done := false
+# Started when the first player hits their intro duck; see INTRO_PARTY_GRACE_SEC.
+var intro_grace_timer: SceneTreeTimer = null
+# True while the dog is up presenting a duck. There is one dog node, so overlapping runs would
+# fight over its position; see _present_hit_duck_async.
+var dog_presenting := false
 var party_player_count := 0
 var party_mode := false
 var party_spawning_players := {}
@@ -114,6 +122,23 @@ const DUCK_SFX_VOLUME_DB = -8.0
 const SHOTGUN_SFX_VOLUME_DB = -14.0
 const SHOTGUN_RELOAD_VOLUME_DB = -16.0
 const DOG_SFX_VOLUME_DB = -9.0
+
+# How long the party intro screen will wait for every player to hit their duck before giving up
+# and starting the game anyway.
+#
+# There was no escape from this wait at all, and Pan hit the consequence (2026-08-05: 畫面卡在
+# 開頭打兩隻鴨子的地方 / 有一顆握力球做什麼都沒反應 進不了正式遊戲). One ball that enrols but
+# never engages still gets an intro duck, and the screen waited for every duck, so a single dead
+# ball locked the game out permanently with no way past it.
+#
+# Two fixes together: only players whose ball has actually pressed are required (see
+# _intro_required_players), and this timeout backstops even that - the intro screen is a title
+# card, and no fault in it is worth being unable to play.
+const INTRO_PARTY_TIMEOUT_SEC = 20.0
+# Once at least one player has hit their duck, the others get this much longer and then the game
+# starts. Much shorter than the full timeout: one duck down proves the input path works, so
+# anybody still missing is a hardware problem, not a player taking their time.
+const INTRO_PARTY_GRACE_SEC = 8.0
 
 
 # Shuffle bag for duck types to increase "randomness feel"
@@ -178,8 +203,15 @@ func _ready():
 	party_player_count = maxi(GripballInput.player_count, 1)
 	if party_mode:
 		print("Gripball party mode: " + str(party_player_count) + " player(s)")
+		# The dog stays. Pan asked for the retrieval back (2026-08-05: 我記得 先前版本都把狗抓到
+		# 鴨子的橋段刪掉了 但其實那很可愛) - it was never deleted, just switched off here.
+		#
+		# Only the retrieval, though. play_dog_intro is the sniff-and-jump that runs BEFORE the
+		# first duck and is awaited by _ready(), which would hold four players on a static screen
+		# for ~7s with nothing to do; the retrieval is a ~1.7s reaction to something they just
+		# did, and in Party Mode it does not block anybody (see _present_hit_duck_async).
 		play_dog_intro = false
-		present_hit_duck = false
+		present_hit_duck = true
 		max_bullets = maxi(max_bullets, party_player_count * 99)
 	### Quick debug mode
 	if quick_debug_mode:
@@ -328,10 +360,101 @@ func _show_intro_screen():
 	var _anim_player = intro_screen.get_node("AnimationPlayer")
 	_anim_player.get_animation("blink_continue_text").set_loop_mode(true)
 	_anim_player.play("blink_continue_text")
-	await intro_screen_continued
+	if party_mode:
+		# Never a bare await here. See INTRO_PARTY_TIMEOUT_SEC: the signal is only emitted when
+		# every required player has hit their duck, and a ball that cannot engage will never hit
+		# anything, so an unbacked await is an unrecoverable lock-out of the whole game.
+		await _await_intro_continue()
+	else:
+		await intro_screen_continued
 	_anim_player.stop()
 	_continue_label.hide()
 	await _exit_intro_screen()
+
+
+# Wait for the intro screen to be finished, but never indefinitely.
+#
+# Races the real "everybody hit their duck" signal against a timeout. Whichever comes first
+# wins, and intro_continue_done makes sure the loser cannot fire a second continue into a game
+# that has already started.
+func _await_intro_continue() -> void:
+	var timeout := get_tree().create_timer(INTRO_PARTY_TIMEOUT_SEC)
+	timeout.timeout.connect(_on_intro_party_timeout)
+	while not intro_continue_done:
+		await intro_screen_continued
+	if timeout.timeout.is_connected(_on_intro_party_timeout):
+		timeout.timeout.disconnect(_on_intro_party_timeout)
+
+
+func _start_intro_grace() -> void:
+	if intro_continue_done or intro_grace_timer != null:
+		return
+	intro_grace_timer = get_tree().create_timer(INTRO_PARTY_GRACE_SEC)
+	intro_grace_timer.timeout.connect(_on_intro_grace_timeout)
+
+
+func _on_intro_grace_timeout() -> void:
+	intro_grace_timer = null
+	if intro_continue_done:
+		return
+	print("Intro screen grace period elapsed, starting with " +
+			str(_intro_players_waiting().size()) + " player(s) still waiting")
+	_finish_intro_screen()
+
+
+func _on_intro_party_timeout() -> void:
+	if intro_continue_done:
+		return
+	push_warning(
+			"Intro screen timed out after " + str(INTRO_PARTY_TIMEOUT_SEC) +
+			"s - starting anyway. Players still waiting: " + str(_intro_players_waiting())
+	)
+	print("Intro screen timed out, starting game anyway")
+	_finish_intro_screen()
+
+
+# The players the intro screen is allowed to wait for: those whose ball has been seen to press.
+#
+# An enrolled ball is not a working ball. It can be authorized, opened and streaming pressure
+# reports and still never cross its engage bar, in which case it can neither track nor shoot -
+# and requiring it to hit a duck is requiring something impossible. GripballInput marks a player
+# proven on their first real press (signal player_proven).
+#
+# If nobody has pressed yet, every player is required: that is the normal state a fraction of a
+# second after the screen appears, and dropping the requirement then would start the game before
+# anyone had touched anything.
+func _intro_required_players() -> Array:
+	var proven: Array = []
+	for player_id in intro_players_hit.keys():
+		if bool(GripballInput.players_proven.get(player_id, false)):
+			proven.append(player_id)
+	if proven.is_empty():
+		return intro_players_hit.keys()
+	return proven
+
+
+func _intro_players_waiting() -> Array:
+	var waiting: Array = []
+	for player_id in _intro_required_players():
+		if not bool(intro_players_hit.get(player_id, false)):
+			waiting.append(player_id + 1)
+	return waiting
+
+
+# Leave the intro screen for good. Idempotent, because it is reachable from three places (the
+# last duck being hit, the grace timer, and the overall timeout) and any two of them can be in
+# flight at once - a second continue would land in the running game.
+func _finish_intro_screen() -> void:
+	if intro_continue_done:
+		return
+	intro_continue_done = true
+	var anim = intro_screen.get_node_or_null("AnimationPlayer")
+	if anim:
+		anim.stop()
+	var label = intro_screen.get_node_or_null("ContinueLabel")
+	if label:
+		label.hide()
+	intro_screen_continued.emit()
 
 
 func _spawn_intro_screen_duck():
@@ -541,6 +664,19 @@ func _dog_laugh():
 	await get_tree().create_timer(0.5).timeout
 
 
+# Party Mode's route into _dog_present_duck. Fire-and-forget on purpose - see the call site in
+# _on_next_duck - and single-flight, because there is one dog: two ducks landing at once would
+# otherwise both reposition and re-show the same node, and the second would cut the first off
+# mid-slide and leave the dog stranded (its own animation restores position, so an interrupted
+# run does not restore it).
+func _present_hit_duck_async(_duck_hit_position, _duck_type) -> void:
+	if dog_presenting:
+		return
+	dog_presenting = true
+	await _dog_present_duck(_duck_hit_position, _duck_type)
+	dog_presenting = false
+
+
 # Dog presents hit duck after it fell into grass
 # TODO: Refactor potentially redundant code with functions "_dog_laugh" and "_dog_jump_into_grass"
 func _dog_present_duck(_duck_hit_position, _duck_type):
@@ -717,6 +853,15 @@ func _on_next_duck(source_duck = null, player_id := -1):
 			if active_duck.duck_hit:
 				await _increase_ducks_shot()
 				score_current += points_per_duck
+				# The dog comes up out of the grass holding the duck. Deliberately NOT awaited
+				# here: in Party Mode every player has their own duck and their own respawn
+				# clock, so waiting out a ~1.7s animation would stall that player's next duck
+				# and, with four players, stall it repeatedly. _present_hit_duck_async also
+				# declines if the dog is already up, since there is one dog and it can only be
+				# in one place - so with several ducks landing together the first one gets the
+				# dog and the rest just respawn.
+				if present_hit_duck:
+					_present_hit_duck_async(_duck_hit_position, _duck_type)
 			await get_tree().create_timer(0.45).timeout
 			if game_over_timer.is_stopped():
 				await _spawn_duck(player_id)
@@ -803,6 +948,17 @@ func _input(event):
 				and not _credits_screen_party.visible
 		):
 			shotgun_shot_player.play()
+		# A keyboard escape from the title card, on top of the two timers. Someone watching a
+		# game they cannot start because of a dead ball should not have to wait out a timeout
+		# they have no way of knowing about.
+		if (
+				event.is_action_pressed("ui_accept")
+				and intro_screen.visible
+				and intro_screen_timer.is_stopped()
+				and not _credits_screen_party.visible
+		):
+			print("Intro screen skipped by key press")
+			_finish_intro_screen()
 		return
 	if event.is_action_pressed("left_click"):
 		var _credits_screen = intro_screen.get_node("CreditsScreen")
@@ -1011,16 +1167,27 @@ func _on_gripball_player_shot(player_id: int, aim_position := Vector2.ZERO) -> v
 						intro_landed = true
 						intro_players_hit[player_id] = true
 						intro_duck.shoot()
+						# Only players whose ball has been proven to press are waited for. A ball
+						# that cannot engage cannot hit anything, so counting it here is what used
+						# to hang the game on the title card - see _intro_required_players.
 						var all_hit := true
-						for hit in intro_players_hit.values():
-							if not bool(hit):
+						for required_id in _intro_required_players():
+							if not bool(intro_players_hit.get(required_id, false)):
 								all_hit = false
 								break
 						if all_hit:
+							# Stop the blinking before the beat, not after it: the prompt has been
+							# answered, so leaving it flashing through the pause reads as though
+							# the shot did not register.
 							intro_screen.get_node("AnimationPlayer").stop()
 							intro_screen.get_node("ContinueLabel").hide()
 							await get_tree().create_timer(0.7).timeout
-							intro_screen_continued.emit()
+							_finish_intro_screen()
+						else:
+							# One duck down proves the input path works, so anybody still missing is
+							# a hardware problem rather than a slow player. Give them a short grace
+							# period and then go regardless.
+							_start_intro_grace()
 				if not intro_landed:
 					_play_web_shot_miss(aim_position, player_id)
 			elif duck:

@@ -6,13 +6,15 @@
  * of counts above the baseline" as on. This drives the real quickStartPlayer() and the real
  * estimateGrip() from gripball_webhid.js against simulated sensor traces.
  *
- * The point of this file is the reachability question, which is the one real risk in the
+ * The point of this file is the reachability question, which was the one real risk in the
  * change: the bar is a fixed number, but each ball has its own range, so a bar above what a
- * ball can produce means the grip simply never registers. The only ball measured so far tops
- * out around 1400 counts (see test_calibration_release.js, MAGNITUDE = 1400). That is stated
- * here as a measurement with an explicit warning rather than as a failure, because the
- * threshold is Pan's call - but it is printed loudly, and the bars' *relationships* (release
- * below engage, full above engage) are hard assertions since those are bugs at any threshold.
+ * ball can produce means the grip simply never registers. This file printed that warning for a
+ * week and then it happened in play - Pan, 2026-08-05: 有一顆握力球做什麼都沒反應 進不了正式遊戲.
+ *
+ * So the bar is now per ball (engageForceFor), scaled to the largest press that ball has been
+ * seen to produce, and reachability is a hard assertion rather than a printed warning: the ball
+ * measured at ~1400 counts (see test_calibration_release.js, MAGNITUDE = 1400) must engage, and
+ * so must one at a quarter of that, without a strong ball engaging on a resting hand.
  *
  * The clock and sleep() are faked, so waiting costs microseconds.
  *
@@ -48,14 +50,21 @@ function tuningDefault(name) {
 const CONSTANTS = [
   "GRIP_STALE_MS", "AUTOZERO_WINDOW_MS",
   "QUICK_ENGAGE_FORCE", "QUICK_RELEASE_RATIO", "QUICK_BASELINE_MS", "QUICK_WAKE_MS",
+  "ADAPTIVE_ENGAGE_RATIO", "ADAPTIVE_ENGAGE_FLOOR",
 ];
 
 const pieces = [
   grab(/function median\(values\) \{[\s\S]*?\n  \}/, "median"),
   grab(/function gripIsLive\(player\) \{[\s\S]*?\n  \}/, "gripIsLive"),
+  grab(/function engageForceFor\(player\) \{[\s\S]*?\n  \}/, "engageForceFor"),
   grab(/function estimateGrip\(player, grip\) \{[\s\S]*?\n  \}/, "estimateGrip"),
   grab(/async function quickStartPlayer\(player\) \{[\s\S]*?\n  \}/, "quickStartPlayer"),
 ];
+
+// The weakest ball's first press has to clear the cold-start bar, and that press is at most its
+// own full squeeze. Expressed as a fraction so the assertion below states the requirement rather
+// than a magic number: a bar over ~45% of a 1400-count ball's range is asking for most of it.
+const ADAPTIVE_RATIO_FLOOR_CHECK = 0.45;
 
 const ENGAGE = tuningDefault("engageForce");
 const RELEASE = tuningDefault("releaseForce");
@@ -81,7 +90,7 @@ const harness = `
   function emit(message) { emitted.push(message); }
   ${pieces.join("\n")}
   return {
-    quickStartPlayer, estimateGrip, tuning, state,
+    quickStartPlayer, estimateGrip, engageForceFor, tuning, state,
     setTrace(fn) { trace = fn; },
     now: () => clock,
     advance(ms) { clock += ms; },
@@ -106,6 +115,7 @@ function makeFixture() {
   return {
     playerId: 0, grip: null, baseline: null, peak: null, travel: 900, tracking: -1,
     holding: false, holdSince: 0, gripLog: [], zeroLog: [], gripNoise: 0, lastGripAt: 0,
+    pressPeak: 0, proven: false,
   };
 }
 
@@ -136,7 +146,7 @@ function press(player, raw) {
 {
   const body = grab(/function makePlayer\(device, playerId\) \{[\s\S]*?\n  \}/, "makePlayer");
   const needed = ["grip", "baseline", "gripLog", "zeroLog", "holding", "holdSince",
-                  "lastGripAt", "travel", "tracking", "peak"];
+                  "lastGripAt", "travel", "tracking", "peak", "pressPeak", "proven"];
   const missing = needed.filter((f) => !new RegExp(`\\b${f}:`).test(body));
   if (missing.length) {
     throw new Error("fixture out of date; makePlayer() no longer sets: " + missing.join(", "));
@@ -213,18 +223,35 @@ async function main() {
     const base = player.baseline;
     mod.setTrace(null);   // drive estimateGrip() by hand from here
 
+    // Read the bar off the code rather than assuming the configured number: it is now per ball,
+    // and a fresh ball with no press history is deliberately held at the floor so that even the
+    // weakest ball's first press can register (that press is the only evidence of its range).
+    const bar = mod.engageForceFor(player);
+    console.log(`       a ball with no press history uses a bar of ${Math.round(bar)} ` +
+                `(configured ceiling ${ENGAGE})`);
+    check("a fresh ball's bar is low enough for a weak ball's first press",
+          bar <= 1400 * ADAPTIVE_RATIO_FLOOR_CHECK, `${Math.round(bar)}`);
     check("resting is off", press(player, base) === false);
-    check("just under the bar is still off", press(player, base + ENGAGE - 1) === false,
-          `force ${ENGAGE - 1} vs bar ${ENGAGE}`);
-    check("reaching the bar turns it on", press(player, base + ENGAGE) === true);
+    check("just under the bar is still off", press(player, base + bar - 1) === false,
+          `force ${Math.round(bar - 1)} vs bar ${Math.round(bar)}`);
+    check("reaching the bar turns it on", press(player, base + bar) === true);
     // Hysteresis: between the two bars it must stay on, or a hand holding steady near the
-    // threshold would flicker the crosshair.
-    const mid = Math.round((ENGAGE + RELEASE) / 2);
+    // threshold would flicker the crosshair. The release bar is a fraction of the bar in use,
+    // not of the configured one - on a scaled-down bar the configured release value can sit
+    // ABOVE the engage bar, which would release the instant it engaged.
+    const release = Math.min(RELEASE, bar * constant("QUICK_RELEASE_RATIO"), bar * 0.9);
+    check("the release bar is below the bar actually in use",
+          release < bar, `release ${Math.round(release)} vs bar ${Math.round(bar)}`);
+    const mid = Math.round((bar + release) / 2);
     check("easing off but staying above the release bar keeps it on",
           press(player, base + mid) === true, `force ${mid}`);
     check("dropping below the release bar turns it off",
-          press(player, base + RELEASE - 1) === false, `force ${RELEASE - 1}`);
-    check("and it can be turned on again", press(player, base + ENGAGE) === true);
+          press(player, base + release - 1) === false, `force ${Math.round(release - 1)}`);
+    // Against the CURRENT baseline, not the one recorded before the release: sitting at rest is
+    // exactly when the auto-zero drift runs, so a few counts of movement here is the drift
+    // working, not the bar failing.
+    check("and it can be turned on again",
+          press(player, player.baseline + mod.engageForceFor(player)) === true);
   }
 
   console.log("\nA slow squeeze is not penalised by the resting auto-zero");
@@ -306,36 +333,86 @@ async function main() {
     check("full force reaches the top of the range", atFull > 0.95, String(atFull));
   }
 
-  console.log("\nREACHABILITY: can a real ball actually reach the bar?");
+  console.log("\nREACHABILITY: every ball must be able to turn its own grip on");
   {
-    // The measured hardware range, kept in step with test_calibration_release.js.
-    const MEASURED_FULL_SQUEEZE = 1400;
-    const headroom = MEASURED_FULL_SQUEEZE - ENGAGE;
-    console.log(`       bar ${ENGAGE}, measured full squeeze ~${MEASURED_FULL_SQUEEZE} ` +
-                `=> headroom ${headroom}`);
+    // This is the section that used to print a warning instead of failing, and the thing it
+    // warned about is what Pan hit: 有一顆握力球做什麼都沒反應 進不了正式遊戲. A ball that cannot
+    // engage cannot track, cannot shoot, and (before the intro-screen fix) took the whole game
+    // down with it. So it is asserted now, across a range of hardware, not printed.
+    //
+    // The three squeezes below are: the one ball actually measured (~1400 counts, in step with
+    // test_calibration_release.js), a much weaker one, and one strong enough to reach the
+    // configured bar. All three must work with no per-device configuration.
+    const squeezeTest = async (fullSqueeze, label) => {
+      const player = playerDrivenBy((t) => REST + wobble(t, 4));
+      await mod.quickStartPlayer(player);
+      mod.setTrace(null);
+      const base = player.baseline;
+      // A press at the ball's own maximum, held for a few samples the way a real hand would be.
+      // The first press is what teaches the code this ball's range, so what matters is that it
+      // engages during that press and not several presses later.
+      let engagedOnFirstPress = false;
+      for (let i = 0; i < 6; i += 1) {
+        mod.advance(16);
+        if (press(player, base + fullSqueeze)) { engagedOnFirstPress = true; break; }
+      }
+      // Releasing must still read as released, or the crosshair would stick on.
+      mod.advance(16);
+      const releases = press(player, base) === false;
+      // And it must engage again on the next press, now that its range is known.
+      mod.advance(16);
+      const again = press(player, base + fullSqueeze) === true;
+      const bar = mod.engageForceFor(player);
+      console.log(`       ${label} (full squeeze ${fullSqueeze}): bar settled at ` +
+                  `${Math.round(bar)} => ${engagedOnFirstPress ? "engages" : "NEVER ENGAGES"}`);
+      check(`a ball topping out at ${fullSqueeze} counts can turn its grip on`,
+            engagedOnFirstPress, "never crossed its own bar at full squeeze");
+      check(`...and letting go of it reads as released (${fullSqueeze})`, releases);
+      check(`...and it engages again on the next press (${fullSqueeze})`, again);
+      return {player, bar};
+    };
+
+    await squeezeTest(1400, "the measured ball");
+    await squeezeTest(350, "a much weaker ball");
+    const strong = await squeezeTest(6000, "a ball that can reach the configured bar");
+    // The other half of the requirement. Adapting the bar downward must not become "engages on
+    // anything": a strong ball's bar has to stay up at the configured one, so the weight of a
+    // hand resting on it is nowhere near enough.
+    check("a strong ball still uses the full configured bar, not a scaled-down one",
+          Math.abs(strong.bar - ENGAGE) < 1, `${Math.round(strong.bar)} vs ${ENGAGE}`);
+    const resting = press(strong.player, strong.player.baseline + 120);
+    check("...so a hand merely resting on a strong ball does not engage it", resting === false);
+    // A bar that even a very strong ball cannot reach is almost certainly a typo, so guard
+    // that outer bound too.
+    check("the configured ceiling is within the plausible hardware range",
+          ENGAGE <= 8000, `${ENGAGE} vs 8000`);
+  }
+
+  console.log("\nA ball is only 'proven' once it has really been pressed");
+  {
+    // What the intro screen waits on. An enrolled ball is not a working ball: it can be
+    // authorized, opened and streaming and still never engage, and requiring it to shoot a duck
+    // is requiring something impossible - which is exactly how the title card locked up.
     const player = playerDrivenBy((t) => REST + wobble(t, 4));
     await mod.quickStartPlayer(player);
     mod.setTrace(null);
-    const reachable = press(player, player.baseline + MEASURED_FULL_SQUEEZE);
-    if (!reachable) {
-      // Deliberately not a failure: the threshold is Pan's decision, taken after the risk was
-      // raised. But it must be impossible to miss when the suite runs.
-      console.log("");
-      console.log("       *** WARNING: a full squeeze on the measured ball does NOT reach " +
-                  "the bar. ***");
-      console.log(`       *** On that hardware the grip will never turn on. Lower ` +
-                  `QUICK_ENGAGE_FORCE (now ${ENGAGE}) to about ` +
-                  `${Math.round(MEASURED_FULL_SQUEEZE * 0.3)} to use ~30% of its range. ***`);
-      console.log("       *** Nothing else needs changing; the panel's 追蹤啟動 does it live. ***");
-      console.log("");
-    }
-    // What is asserted is that the answer is *known and stated*, not which way it went.
-    check("the reachability of the configured bar is reported either way", true,
-          reachable ? "reachable on the measured ball" : "NOT reachable - see warning above");
-    // A bar that even a very strong ball cannot reach is almost certainly a typo, so guard
-    // that outer bound.
-    check("the bar is at least reachable by a ball at the top of the plausible range",
-          ENGAGE <= 8000, `${ENGAGE} vs 8000`);
+    const base = player.baseline;
+    check("a ball that has only ever idled is not proven", player.proven === false);
+    for (let i = 0; i < 40; i += 1) { mod.advance(16); press(player, base + 30); }
+    check("...and light contact does not prove it either", player.proven === false,
+          `pressPeak ${Math.round(player.pressPeak)}`);
+    mod.advance(16);
+    press(player, base + 1400);
+    check("a real press proves it", player.proven === true);
+    check("...and says so once, with the player id",
+          mod.emitted().filter((e) => e && e.type === "player_proven").length === 1,
+          JSON.stringify(mod.emitted().filter((e) => e && e.type === "player_proven")));
+    mod.advance(16);
+    press(player, base);
+    mod.advance(16);
+    press(player, base + 1400);
+    check("...and does not re-announce on every later press",
+          mod.emitted().filter((e) => e && e.type === "player_proven").length === 1);
   }
 
   console.log("\nThe tuning panel can express the configured bars");

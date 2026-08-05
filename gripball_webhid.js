@@ -70,12 +70,17 @@
   // baseline counts as "on". The whole three-round sequence existed only to learn each
   // ball's own range, and it cost ~20s per player and could still stall on sensor creep.
   //
-  // KNOWN RISK, raised with Pan and kept at their decision: the one ball measured so far
-  // produces about 1400 counts at a full squeeze (see tools/test_calibration_release.js,
-  // MAGNITUDE = 1400), so a bar of 3000 is above what that ball can reach and it will never
-  // turn on. If that happens in play the fix is this number alone - lower it, nothing else
-  // has to change. QUICK_ENGAGE_FORCE is also exposed in the tuning panel as 追蹤啟動, so it
-  // can be changed live without a rebuild.
+  // The risk flagged when this went in has now happened in play (Pan, 2026-08-05: 有一顆握力
+  // 球做什麼都沒反應): balls differ enormously in what a full squeeze produces - the one
+  // measured here tops out near 1400 counts (see tools/test_calibration_release.js,
+  // MAGNITUDE = 1400) - so ANY single fixed bar is above what some ball can reach, and that
+  // ball simply never turns on. Lowering the constant only moves which balls are excluded:
+  // set it low enough for the weakest ball and a strong ball engages on the weight of a hand
+  // resting on it.
+  //
+  // So the bar is now a ceiling rather than the bar itself, and each ball scales its own down
+  // to fit its own range - see engageForceFor(). This constant is what a ball that can reach
+  // it actually uses, and is still exposed in the tuning panel as 追蹤啟動.
   const QUICK_ENGAGE_FORCE = 3000;
   // Hysteresis, so a reading hovering at the bar does not chatter on and off. Held at a
   // fraction rather than a second constant: whatever the bar is retuned to, the release
@@ -90,6 +95,28 @@
   // If no readings arrive at all we cannot invent a zero. The ball sleeps until squeezed, so
   // this waits for the stream rather than failing outright.
   const QUICK_WAKE_MS = 12000;
+  // Per-ball adaptation of the bar above. A ball is only asked for this fraction of the
+  // largest press it has actually been seen to produce, capped at the configured bar - so a
+  // ball with a small range gets a small bar and one with a big range gets the full one, and
+  // neither number has to be guessed per device. 0.45 is a deliberate squeeze on any range
+  // (well clear of the weight of a hand) without needing the last of the ball's travel, which
+  // is where the sensor is least linear.
+  const ADAPTIVE_ENGAGE_RATIO = 0.45;
+  // Hard lower bound on any ball's bar, and also the bar a ball uses before it has produced
+  // anything at all. Two opposing requirements meet here:
+  //
+  //  - It must be crossable by the weakest ball on its VERY FIRST press, because that press is
+  //    the only evidence of the ball's range there will ever be. The only ball measured produces
+  //    ~1400 counts at full squeeze; this is set to work down to a quarter of that, since the
+  //    ball that prompted all this has an unknown and evidently smaller range.
+  //  - It must sit above the counts a hand merely resting on the ball produces, or tracking
+  //    would switch itself on when nobody asked.
+  //
+  // 200 clears the resting-hand case with margin. If it ever did latch on - a ball held firmly
+  // enough to pass, before any real press has taught it a higher bar - it un-latches itself:
+  // the auto-zero in estimateGrip() re-zeros a grip that has been held flat for
+  // AUTOZERO_WINDOW_MS and drops the hold, which is precisely a hand resting on the ball.
+  const ADAPTIVE_ENGAGE_FLOOR = 200;
 
   // Auto-start (Pan, 2026-07-30): once balls are connected there is nothing left to ask, so
   // do not make anyone press 開始遊戲. Connecting is now the only deliberate action.
@@ -172,6 +199,41 @@
     }
   }
 
+  /**
+   * The engage bar for one ball. tuning.engageForce is the ceiling (and stays the bar for any
+   * ball whose range can reach it); a ball whose largest observed press is smaller gets a bar
+   * scaled to that press instead.
+   *
+   * This is what fixes "one ball does nothing no matter what": with a single fixed bar of
+   * 3000, a ball that physically produces 1400 counts at full squeeze can never engage, so it
+   * never tracks, never emits track_player, and - because the intro screen waits for every
+   * enrolled player - takes the whole game down with it. It needs no calibration round: the
+   * evidence is the presses the player is already making.
+   *
+   * Note this only ever lowers the bar. A ball that can reach the configured number is left
+   * exactly as it was, so nothing changes for the balls that already worked.
+   */
+  function engageForceFor(player) {
+    const bar = tuning.engageForce;
+    if (!player) return bar;
+    const seen = player.pressPeak;
+    if (!(seen > 0)) {
+      // Nothing pressed yet this session. Ask for the floor rather than the full bar, so the
+      // first press of the weakest ball can still register - that press is the only way the
+      // ball's range can ever become known.
+      return Math.min(bar, ADAPTIVE_ENGAGE_FLOOR);
+    }
+    // A ball that has been seen to reach the configured bar keeps the configured bar exactly.
+    // Scaling that case down too would lower the bar on balls that never had a problem - and
+    // since ADAPTIVE_ENGAGE_RATIO is well under 1, it would lower it on every ball.
+    if (seen >= bar) return bar;
+    // The floor is a hard lower limit for every ball, not a starting point: it is what stops the
+    // ratio from tracking a resting hand all the way down. A ball whose full squeeze cannot
+    // produce ADAPTIVE_ENGAGE_FLOOR counts is genuinely unusable, and there is no way around
+    // that - the whole range would then be indistinguishable from the weight of a hand.
+    return Math.max(ADAPTIVE_ENGAGE_FLOOR, seen * ADAPTIVE_ENGAGE_RATIO);
+  }
+
   function fireRelease(player) {
     const rest = player.accelRest == null ? tuning.fireAccel * 0.4 : player.accelRest;
     if (tuning.fireAccel <= rest) return tuning.fireAccel * 0.9;
@@ -248,6 +310,13 @@
       grip: null,
       baseline: null,
       peak: null,
+      // Largest force above baseline this ball has produced this session. Drives
+      // engageForceFor(), which is what lets a weak ball reach its own bar.
+      pressPeak: 0,
+      // Whether this ball has ever produced a force big enough to count as a deliberate
+      // press. A ball that has not is not counted as a player by the intro screen, so a dead
+      // or unheld ball cannot spawn a duck nobody can shoot.
+      proven: false,
       travel: 900,
       tracking: -1,
       holding: false,
@@ -337,8 +406,17 @@
       return;
     }
     const force = grip - player.baseline;
-    const engageForce = tuning.engageForce;
-    const releaseForce = Math.min(tuning.releaseForce, engageForce * 0.9);
+    // Learn this ball's range from the presses the player is already making, before deciding
+    // the bar - otherwise a ball whose whole range is under the configured bar could never
+    // record a press, and so could never earn a bar it can reach.
+    if (force > player.pressPeak) player.pressPeak = force;
+    const engageForce = engageForceFor(player);
+    // The release bar is a fraction of the bar actually in use, not of the configured one: on
+    // a ball whose bar has been scaled down, the configured release value can sit ABOVE its
+    // engage bar, which would release the instant it engaged.
+    const releaseForce = Math.min(
+      tuning.releaseForce, engageForce * QUICK_RELEASE_RATIO, engageForce * 0.9
+    );
     const now = performance.now();
     if (player.holding) {
       if (force < releaseForce) {
@@ -348,6 +426,12 @@
     } else if (force >= engageForce) {
       player.holding = true;
       player.holdSince = now;
+      if (!player.proven) {
+        // First real press from this ball. Tell the game, so an intro screen that has been
+        // waiting on this player can now count them.
+        player.proven = true;
+        emit({type: "player_proven", player: player.playerId});
+      }
     }
 
     player.gripLog.push(now, grip);
@@ -386,11 +470,28 @@
     // sample or two), but at a bar of thousands it is not - a slow squeeze towards a bar of
     // 3000 has to actually reach ~4000 counts, and a slower one more still. Rest is a small
     // fraction of the bar, so anything above that is a press in progress, not new rest.
-    const restBand = Math.max(20, engageForce * 0.15);
-    if (state.phase === "play" && !player.holding && force < restBand) {
+    //
+    // The band is the configured fraction, but capped at half of the bar THIS ball is using: on
+    // a ball whose bar has been scaled down, a band of 450 counts could be most of a press, and
+    // the drift would then be doing the very hand-chasing it is gated to prevent.
+    const restBand = Math.max(20, Math.min(engageForce * 0.5, tuning.engageForce * 0.15));
+    // Downward correction is never gated. A reading BELOW the recorded rest cannot be a press
+    // in progress whatever its size, and a baseline recorded too high is the dangerous kind of
+    // error - it is subtracted from every reading, so it pushes the bar out of reach and is
+    // exactly what a ball still rebounding at start-up produces (measured in
+    // tools/test_quick_start.js at ~788 counts). Capping that correction to the rest band would
+    // leave the ball unusable for as long as it took to creep back.
+    if (state.phase === "play" && !player.holding && (force < restBand || grip < player.baseline)) {
       player.baseline = player.baseline * 0.995 + grip * 0.005;
     }
-    const rawStrength = Math.max(0, Math.min(1, force / Math.max(tuning.fullForce, 20)));
+    // Full-speed force gets the same per-ball treatment as the engage bar, and for the same
+    // reason: on a ball whose whole range is under tuning.fullForce, tracking would be stuck
+    // near the minimum speed however hard it was squeezed, so pressure would stop meaning
+    // anything. Held above the ball's own engage bar so the scale still has room in it.
+    const fullForce = Math.max(
+      engageForce * 1.5, Math.min(tuning.fullForce, Math.max(player.pressPeak, 20))
+    );
+    const rawStrength = Math.max(0, Math.min(1, force / fullForce));
     const strength = player.holding ? Math.max(0.18, Math.sqrt(rawStrength)) : 0;
     if (state.phase === "play" && Math.abs(strength - player.tracking) >= 0.015) {
       player.tracking = strength;
@@ -1332,6 +1433,14 @@
     if (control.action === "track") {
       player.tracking = pressed ? 1 : 0;
       player.holding = pressed;
+      // Keyboard players never go through estimateGrip(), so they have to prove themselves
+      // here. Without this the intro screen would keep waiting on a keyboard player who has
+      // hit their duck - the very deadlock the proven flag is there to prevent, arriving by
+      // the other input path.
+      if (pressed && !player.proven) {
+        player.proven = true;
+        emit({type: "player_proven", player: control.player});
+      }
       emit({type: "track_player", player: control.player, value: pressed ? 1 : 0});
       return;
     }
@@ -1972,11 +2081,20 @@
     // tone nearly as loud as a quack): this lands the delivered peak around -10..-15dB
     // relative to the quack - clearly present, still plainly a background cue.
     //
-    // Halved again for the trill: two notes alternating is a far more attention-grabbing
-    // signal than one held note at the same level, and at 0.24 the trill read as the loudest
-    // thing on screen. It is also the reason TRILL_LOW_GAIN exists rather than pushing this
-    // number around - the balance wanted is *between the two notes*, not overall.
-    const TONE_PEAK_GAIN = 0.13;      // still deliberately under the game's own sounds
+    // Halving this for the trill was wrong. The reasoning - that two alternating notes read
+    // louder than one held note at the same gain, so the trill needed less - is true of
+    // attention but not of audibility, and 0.13 put the delivered tone about -15dB under a
+    // quack, i.e. under the music and the shotgun as well. Pan's verdict on playing it:
+    // 瞄準的音量太小了 (2026-08-05).
+    //
+    // Back up, and past the pre-trill 0.24, to land the delivered level around -6dB relative
+    // to a quack (0.24 measured -10dB in Chrome, so 0.36 is -6.5dB). That is the level a
+    // background cue wants: plainly there over the mix, still obviously not one of the game's
+    // own sounds. Note what this figure has to survive before it reaches the ear - the swell
+    // floor (0.55 at the far end), the Party Mode share (1/sqrt(4) = 0.5 with four players)
+    // and the convolver's own ~-19dB on a narrowband source - which is why the number looks
+    // large next to the one-shots' gains and is not.
+    const TONE_PEAK_GAIN = 0.36;      // still deliberately under the game's own sounds
     // The trill's lower note is the one that has to survive: after tilt compensation the low
     // note still reads slightly weaker than its partner (the tilt fit is a straight line
     // through a curve, and the residual at the bottom of the range is about +1.5dB), and the
@@ -2508,7 +2626,10 @@
             state.keyboardMode ? "鍵盤測試：A/S 控 P1，K/L 控 P2。A/K 按住追蹤，S/L 開槍。" : state.players.map((player) => {
               const force = player.grip == null || player.baseline == null
                 ? 0 : Math.round(player.grip - player.baseline);
-              const engage = Math.round(tuning.engageForce);
+              // The bar this ball is actually using, not the configured ceiling. Showing the
+              // ceiling was actively misleading on a ball whose bar had been scaled down: the
+              // readout said 力800/3000 while the grip was on, which reads as broken.
+              const engage = Math.round(engageForceFor(player));
               const accel = player.accel == null ? 0 : player.accel;
               const fire = tuning.fireAccel;
               const raw = player.grip == null ? "--" : Math.round(player.grip);

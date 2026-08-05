@@ -275,14 +275,23 @@ console.log("\nA narrowband tone survives the IRs' weak low end");
   check("...and the tone cannot exceed the game's own sounds even with sidebands added",
         Math.max(...outs) < QUACK_REQUEST, Math.max(...outs).toFixed(3));
 
-  // Regression guard on the specific values that shipped silent. The floor used to be 0.16,
-  // set when the voice was one held note; the trill deliberately went below it, to 0.13. Two
-  // notes alternating at 7-13Hz read considerably louder than either note held at the same
-  // gain - the alternation keeps re-triggering attention where a steady tone fades into the
-  // background - so equal gain would have put the cue over the game's own sounds. The floor
-  // is kept as a guard against a slip back toward zero, just at the trill's own level.
-  check("TONE_PEAK_GAIN is not back at the value that shipped inaudible", peak > 0.1,
+  // Regression guard on values that shipped too quiet to hear. This has now been wrong in that
+  // direction twice: 0.16 shipped inaudible, and then the trill was taken DOWN to 0.13 on the
+  // theory that an alternating pair reads louder than a held note - which is true of attention
+  // but not of audibility, and Pan reported it too quiet again. So the floor sits above both,
+  // and the headroom assertion above is what stops it running the other way.
+  check("TONE_PEAK_GAIN is above the levels that shipped too quiet to hear", peak > 0.2,
         String(peak));
+  // What actually has to hold at the far end of the sweep, where the cue matters most and
+  // every reduction stacks: the swell floor (0.55), the Party Mode share with four players
+  // (1/sqrt(4)), and the convolver's own loss on a narrowband source. That is the case both
+  // previous too-quiet values failed, and reading it off a single peak gain is what hid it.
+  const worstCase = outs[0] * 0.5;   // outs[0] already includes the 0.55 swell at closeness 0
+  console.log(`       far end, 4 players: ${db(worstCase / QUACK_REQUEST).toFixed(1)}dB ` +
+              `vs a quack (carrier only; Chrome measures ~+12dB on this)`);
+  check("the quietest case the player ever hears is still above the mix",
+        db(worstCase / QUACK_REQUEST) > -26,
+        `${db(worstCase / QUACK_REQUEST).toFixed(1)}dB vs a quack`);
   // The flat path must not get the correction: it has no shortfall to correct.
   check("the PannerNode fallback is exempt from the tilt (it is already flat)",
         /voice\.panner \? 1 : tiltCompensation\(hz\)/.test(js));

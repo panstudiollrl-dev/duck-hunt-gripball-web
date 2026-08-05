@@ -39,8 +39,12 @@ const pieces = [
   grab(/function nearestAzimuth\(azimuths, target\) \{[\s\S]*?\n    \}/, "nearestAzimuth"),
   grab(/function hrirNameFor\(vector\) \{[\s\S]*?\n    \}/, "hrirNameFor"),
   grab(/function sourceVector\(x, y, vw, vh\) \{[\s\S]*?\n    \}/, "sourceVector"),
+  grab(/const TRILL_TABLE_SAMPLES = [\s\S]*?function getTrillTable\(\) \{[\s\S]*?\n    \}/,
+       "getTrillTable"),
+  grab(/function trillRate\(context, hz\) \{[\s\S]*?\n    \}/, "trillRate"),
   grab(/const TONE_TIMBRES = \[[\s\S]*?\n    \];/, "TONE_TIMBRES"),
   grab(/function timbreFor\(id\) \{[\s\S]*?\n    \}/, "timbreFor"),
+  grab(/function trillTiltRatio\(lowHz, highHz\) \{[\s\S]*?\n    \}/, "trillTiltRatio"),
   grab(/function lockEnvelope\(closeness, locked\) \{[\s\S]*?\n    \}/, "lockEnvelope"),
   // Compensates the IRs' weak low end; test_hrir_loudness.js checks the dB arithmetic.
   grab(/function tiltCompensation\(hz\) \{[\s\S]*?\n    \}/, "tiltCompensation"),
@@ -56,7 +60,8 @@ const pieces = [
 
 const CONSTANTS = ["TONE_MIN_HZ", "TONE_MAX_HZ", "TONE_PEAK_GAIN", "TONE_FADE_MS",
                    "TONE_GLIDE_MS", "TONE_LOCK_START", "TONE_LOCK_SILENT", "TONE_LOCK_MS",
-                   "TONE_TILT_DB_PER_OCT", "TONE_TILT_REF_HZ", "HRIR_MATCH", "HRIR_MIN_NORM"];
+                   "TONE_TILT_DB_PER_OCT", "TONE_TILT_REF_HZ", "HRIR_MATCH", "HRIR_MIN_NORM",
+                   "TONE_TRILL_MIN_HZ", "TONE_TRILL_MAX_HZ", "TRILL_LOW_GAIN"];
 
 // Stub Web Audio. Every node records its kind and outgoing connections; AudioParams record
 // every scheduled change so ramps can be inspected. The stub's label is "kind", not "type",
@@ -85,8 +90,22 @@ const harness = `
   }
   const context = {
     get currentTime() { return now; },
+    sampleRate: 48000,
     createOscillator: () => node("osc", {
       type: "", frequency: param(440), detune: param(0),
+      started: null, stopped: null,
+      start(t) { this.started = t === undefined ? 0 : t; },
+      stop(t) { this.stopped = t; },
+    }),
+    // The trill square is a looping AudioBufferSourceNode rather than an oscillator, so the
+    // stub has to be able to hand out a buffer and a source that plays it.
+    createBuffer: (channels, length, sampleRate) => ({
+      numberOfChannels: channels, length, sampleRate,
+      _data: Array.from({length: channels}, () => new Float32Array(length)),
+      getChannelData(i) { return this._data[i]; },
+    }),
+    createBufferSource: () => node("bufferSource", {
+      buffer: null, loop: false, playbackRate: param(1),
       started: null, stopped: null,
       start(t) { this.started = t === undefined ? 0 : t; },
       stop(t) { this.stopped = t; },
@@ -112,7 +131,8 @@ const harness = `
     nodes: () => nodes,
     fetched: () => fetched,
     reset() { nodes = []; fetched = []; voices.clear(); },
-    hrirGainFor, tiltCompensation,
+    hrirGainFor, tiltCompensation, trillTiltRatio, trillRate, getTrillTable,
+    TRILL_TABLE_SAMPLES,
     advance(dt) { now += dt; },
     time: () => now,
   };

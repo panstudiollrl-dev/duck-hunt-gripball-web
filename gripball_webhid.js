@@ -1506,6 +1506,28 @@
       scream: "assets/sfx/duck_scream.mp3",
       drop_fall: "assets/sfx/drop_fall.mp3",
       drop_hit: "assets/sfx/drop_hit.mp3",
+      // The "you missed" answer to the aim tone, cut from the first transient of
+      // Duck_Sound_Deisgn/Didn't_Hit_00.wav: -ss 0.3557 -t 0.290, faded out over the last
+      // 55ms and peak-matched to the other sfx. The cut point is the transient's measured
+      // onset (0.3579s) less 2ms, not the 0.330s the waveform overview suggests - cutting at
+      // 0.330 leaves 36ms of silence in front of the attack, which on a cue that answers a
+      // trigger pull is just latency. tools/test_shot_miss.js guards that.
+      //
+      // Measured: peak 0.96 with an instantaneous attack, down 20dB by ~130ms, and a pitch
+      // trajectory that collapses from f0 1312Hz / centroid 2310Hz at +20ms to 375Hz /
+      // 1378Hz by +100ms - a bright click falling immediately onto a ~350Hz body. That fall
+      // is what makes it read as a negative answer rather than as a hit, so the whole decay
+      // is kept rather than just the click.
+      shot_miss: "assets/sfx/shot_miss.mp3",
+    };
+    // Per-sound request level. These are pre-HRIR: the convolver's own per-IR compensation
+    // is applied on top, so they are a mix balance and not an output level.
+    const SOUND_GAINS = {
+      quack: 0.84,
+      scream: 0.92,
+      drop_fall: 0.78,
+      drop_hit: 0.9,
+      shot_miss: 0.86,
     };
     const buffers = {};
     let ctx = null;
@@ -1832,14 +1854,22 @@
       return connectHrtf(source, vector, options);
     }
 
-    async function play(name, x, y, vw, vh) {
+    // Playback rates for shot_miss, one per player. In Party Mode up to four players shoot
+    // at once and every miss would otherwise be the same 0.27s sample, arriving as one
+    // thicker click that tells nobody whose shot it was. A semitone or so apart makes them
+    // separable, the same way TONE_TIMBRES separates the aim tones - and unlike the tones,
+    // pitch is all that is available here, because the source is a fixed recording.
+    const MISS_RATES = [1, 1.06, 0.94, 1.12];
+
+    async function play(name, x, y, vw, vh, variant) {
       try {
         const context = getContext();
         const buffer = await loadBuffer(name);
         const vector = sourceVector(Number(x) || 0, Number(y) || 0, vw, vh);
-        const options = name === "drop_fall"
-          ? {gain: 0.78}
-          : {gain: name === "scream" ? 0.92 : name === "drop_hit" ? 0.9 : 0.84};
+        // shot_miss is asked for at a quack's level even though it is the quietest event in
+        // the game dramatically: it has to be heard *under the shotgun blast*, which fires
+        // from the same frame and is not spatialized, so it has no direction to hide behind.
+        const options = {gain: SOUND_GAINS[name] == null ? 0.84 : SOUND_GAINS[name]};
         const source = context.createBufferSource();
         source.buffer = makeMonoBuffer(buffer);
         const envelope = spatialize(source, vector, options);
@@ -1852,6 +1882,11 @@
           source.stop(context.currentTime + 0.58);
         } else if (name === "scream") {
           source.playbackRate.value = 1.04;
+        } else if (name === "shot_miss") {
+          const index = Number(variant);
+          source.playbackRate.value =
+            MISS_RATES[Number.isFinite(index) ? ((index % MISS_RATES.length) +
+                                                 MISS_RATES.length) % MISS_RATES.length : 0];
         }
         source.start();
         return true;
@@ -1864,18 +1899,66 @@
     // ---------------------------------------------------------------------------------
     // Aim-tracking tone
     //
-    // A sustained FM voice per crosshair while the player is tracking a duck: pitch rises
-    // as the crosshair closes on the duck (the "getting warmer" cue), the voice is
-    // spatialized at the crosshair's own position on screen, and it falls silent at
-    // lock-on so that aiming resolves into silence instead of into a held high note.
+    // A sustained voice per crosshair while the player is tracking a duck. It is a
+    // two-note trill, modelled on Duck_Sound_Deisgn/Crosshair_01.wav: the pitch rises as
+    // the crosshair closes on the duck (the "getting warmer" cue), the trill quickens with
+    // it, the voice is spatialized at the crosshair's own position on screen, and it falls
+    // silent at lock-on so that aiming resolves into silence instead of into a held note.
+    //
+    // The trill replaces a single held note. Measured off the reference take: two notes
+    // 253.2Hz and 481.8Hz (ratio 1.903), alternating every 56ms (8.9Hz, 50/50 duty) with a
+    // flat amplitude and an almost pure spectrum - 99.6% of the energy sits in the two note
+    // bands and only 0.11% lands in 600-900Hz, so whatever made this was barely brighter
+    // than a sine. Two notes carry distance far better than one did: an interval is
+    // recognisable on its own, whereas a lone pitch is only meaningful compared to the
+    // pitch a moment ago, which is exactly the comparison a player mid-game cannot make.
     //
     // Unlike the one-shot duck sounds, this voice keeps sounding while it moves, so
     // switching IRs under it would click. This is the case that needs the A/B convolver
     // crossfade from SonicSquid's G07_Binamix: two convolvers, the inactive one gets the
     // new IR, then a short equal-power-ish ramp hands over between them.
     // ---------------------------------------------------------------------------------
+    // The range of the trill's LOWER note. Its partner is TONE_TIMBRES[].interval above it,
+    // so the pair actually spans 196..746Hz - which is the band the reference take sits in
+    // (its 253/482 pair lands at closeness ~0.4) and the band TONE_TILT_DB_PER_OCT below was
+    // measured over.
     const TONE_MIN_HZ = 196;          // G3 when the crosshair is nowhere near the duck
-    const TONE_MAX_HZ = 784;          // G5 when it is right on top of it
+    const TONE_MAX_HZ = 392;          // G4 when it is right on top of it
+    // Alternation rate, in note changes per second / 2. The reference take holds a steady
+    // 8.93Hz; here it rides closeness instead, because a quickening trill reads as urgency
+    // without touching either pitch or level - a third, independent channel for the same
+    // "getting warmer" message. The reference rate falls at closeness ~0.37, so most of a
+    // sweep is at or above it.
+    const TONE_TRILL_MIN_HZ = 6.5;
+    const TONE_TRILL_MAX_HZ = 13.0;
+    // One cycle of a mathematically exact square wave, used to flip the voice between its
+    // two notes. Deliberately NOT an OscillatorNode set to "square": that is band-limited
+    // (a truncated Fourier series), so it overshoots and rings at every transition, and as
+    // a *pitch* control that ringing turns each note change into a small chirp. A looping
+    // buffer is +1 for half a cycle and -1 for the other with nothing in between, which is
+    // exactly what a trill does. It also means the trill runs at audio rate in the graph
+    // rather than on a JS timer: syncTracking() arrives at 30Hz, which cannot place a 13Hz
+    // alternation without audible jitter.
+    const TRILL_TABLE_SAMPLES = 2048;
+    let trillTable = null;
+    function getTrillTable() {
+      const context = getContext();
+      if (trillTable && trillTable.sampleRate === context.sampleRate) return trillTable;
+      const buffer = context.createBuffer(1, TRILL_TABLE_SAMPLES, context.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < TRILL_TABLE_SAMPLES; i += 1) {
+        data[i] = i < TRILL_TABLE_SAMPLES / 2 ? 1 : -1;
+      }
+      trillTable = buffer;
+      return buffer;
+    }
+    // The table loops once per TRILL_TABLE_SAMPLES frames, so at 48kHz its natural rate is
+    // 23.4Hz; a trill of `hz` therefore wants a playbackRate well under 1. Stretching a
+    // two-valued table only ever interpolates across the two transitions, so the square
+    // stays square.
+    function trillRate(context, hz) {
+      return (hz * TRILL_TABLE_SAMPLES) / context.sampleRate;
+    }
     // Measured in Chrome against the real graph, not chosen by eye. Two things had to be
     // separated here: the convolver's *loudness* compensation (see hrirGainFor - that one is
     // exact) and the fact that a narrowband source loses far more to an HRIR than a
@@ -1888,7 +1971,19 @@
     // again after TONE_TILT_DB_PER_OCT below flattened the sweep (which by itself made the
     // tone nearly as loud as a quack): this lands the delivered peak around -10..-15dB
     // relative to the quack - clearly present, still plainly a background cue.
-    const TONE_PEAK_GAIN = 0.24;      // still deliberately under the game's own sounds
+    //
+    // Halved again for the trill: two notes alternating is a far more attention-grabbing
+    // signal than one held note at the same level, and at 0.24 the trill read as the loudest
+    // thing on screen. It is also the reason TRILL_LOW_GAIN exists rather than pushing this
+    // number around - the balance wanted is *between the two notes*, not overall.
+    const TONE_PEAK_GAIN = 0.13;      // still deliberately under the game's own sounds
+    // The trill's lower note is the one that has to survive: after tilt compensation the low
+    // note still reads slightly weaker than its partner (the tilt fit is a straight line
+    // through a curve, and the residual at the bottom of the range is about +1.5dB), and the
+    // ear also weights ~200Hz below ~400Hz at these levels. A small boost on the low half of
+    // the alternation is what makes the interval read as an interval instead of as a loud
+    // note with a quiet ghost after it.
+    const TRILL_LOW_GAIN = 1.22;
     const TONE_FADE_MS = 90;          // in/out, and the IR handover
     const TONE_GLIDE_MS = 70;         // pitch/volume smoothing between updates
     // The tone drops out once the crosshair is on the duck. Aiming is then a movement
@@ -1909,28 +2004,49 @@
     const TONE_LOCK_MS = 55;          // fast enough to feel like an event, not a click
     // These IRs are 256 taps at 48kHz - 5.3ms, which is about one period at 190Hz - so they
     // carry very little low-frequency energy. Measured over the front arc, the delivered
-    // level of a narrowband source tilts +8.2dB per octave (196Hz: -26dB, 784Hz: -9dB).
+    // level of a narrowband source tilts +8.6dB per octave (196Hz: -28.4dB, 746Hz: -11.4dB).
     // For this tone that lands in the worst possible place: the low pitch means "far from the
     // duck", so the start of every sweep - the part that has to catch your attention - is
-    // ~16dB quieter than the end, and the swell below was making it worse rather than better.
+    // ~17dB quieter than the end, and the swell below was making it worse rather than better.
     // So pre-tilt the level by the inverse. This is a property of the IR length, not of the
     // synth, hence the correction lives here and not in the timbres.
-    const TONE_TILT_DB_PER_OCT = 8.2;
-    const TONE_TILT_REF_HZ = 784;     // full level at the top; correction only ever boosts
+    //
+    // Re-measured for the trill over all 18 notes the P1 pair can produce (196..746Hz) across
+    // the 161 front-arc IRs, by evaluating each IR's DFT at each note rather than rendering:
+    // the fit is 8.58dB/oct, and applying it holds the delivered level inside -12.8..-10.4dB
+    // - a 2.4dB spread across a range that was 17dB before. The correction has to be applied
+    // per *note*, not per voice, which is why trillTiltRatio() below exists: the two notes of
+    // the trill are an octave apart in the extreme, so one shared tilt figure would leave the
+    // very imbalance this is here to remove.
+    const TONE_TILT_DB_PER_OCT = 8.6;
+    const TONE_TILT_REF_HZ = 746;     // full level at the top; correction only ever boosts
     function tiltCompensation(hz) {
       const octaves = Math.log2(Math.max(1, TONE_TILT_REF_HZ) / Math.max(1, hz));
       return Math.pow(10, (TONE_TILT_DB_PER_OCT * octaves) / 20);
     }
-    // FM timbres, one per player. Each is a (harmonicity ratio, modulation index) pair -
-    // the two numbers that decide an FM voice's character. Party Mode players need to tell
-    // their own tone apart from everyone else's while all of them sweep the same pitch
-    // range, and timbre separates far better than the detune it replaces: whole different
-    // harmonic series rather than the same sound slightly out of tune.
+    // One entry per player: the FM pair that sets the voice's character, plus the trill
+    // interval. Party Mode players need to tell their own tone apart from everyone else's
+    // while all of them sweep the same pitch range, and timbre separates far better than the
+    // detune it replaces: whole different harmonic series rather than the same sound slightly
+    // out of tune. The interval now separates them a second way, and audibly faster - an
+    // interval is recognisable within one alternation, where a timbre needs a moment.
+    //
+    // The indices are much lower than the sweep's were (1.6..4 -> 0.35..0.9). The reference
+    // take is nearly a pure tone: 99.6% of its energy is in the two note bands and only 0.11%
+    // reaches 600-900Hz. An FM index of 1.6 puts roughly a third of the energy into
+    // sidebands, which is audible as a reedy edge the reference simply does not have - and on
+    // a trill that edge smears the two notes into each other rather than keeping them
+    // distinct. Enough modulation is kept to stop it sounding like a test-tone generator.
     const TONE_TIMBRES = [
-      {ratio: 1, index: 1.6, carrier: "sine"},       // P1: soft, nearly pure, flute-ish
-      {ratio: 2, index: 3.2, carrier: "sine"},       // P2: nasal and reedy, clearly brighter
-      {ratio: 3.5, index: 2.4, carrier: "sine"},     // P3: inharmonic ratio -> bell/metallic
-      {ratio: 0.5, index: 4, carrier: "triangle"},   // P4: hollow, buzzy, sits underneath
+      // P1 reproduces the reference take: 1.903 is its measured 253.2/481.8 ratio, which is
+      // a hair flat of a perfect fifth plus an octave (1.5 -> a minor tenth would be 2.37;
+      // 1.903 is very nearly a minor seventh, 16/9 = 1.778, stretched, or an octave-minus-
+      // semitone). Kept as measured rather than rounded to a just interval - the slightly
+      // impure interval is part of why the reference reads as a bird rather than as music.
+      {ratio: 1, index: 0.35, carrier: "sine", interval: 1.903},
+      {ratio: 2, index: 0.7, carrier: "sine", interval: 1.5},      // P2: brighter, clean fifth
+      {ratio: 3.5, index: 0.5, carrier: "sine", interval: 2.52},   // P3: metallic, wide leap
+      {ratio: 0.5, index: 0.9, carrier: "triangle", interval: 1.26}, // P4: hollow, tight third
     ];
     const voices = new Map();
 
@@ -1938,6 +2054,22 @@
       const count = TONE_TIMBRES.length;
       const index = ((Math.trunc(id) % count) + count) % count;
       return TONE_TIMBRES[index];
+    }
+
+    // How much louder the low note of the trill has to be asked for than the high one, so
+    // that both arrive at the ear at the same level. Two effects, multiplied: the IRs' own
+    // frequency tilt (tiltCompensation, measured) and TRILL_LOW_GAIN (perceptual, judged).
+    // Returned as a ratio rather than two absolute gains because it is applied by modulating
+    // one gain node around the voice's level - the level itself is set by closeness, share
+    // and the lock envelope, and those must not be duplicated per note.
+    //
+    // Verified by rendering the reference note pair (253.2/481.8Hz) offline and convolving it
+    // with the real IRs: across the front arc the high note arrives +6.8dB above the low one
+    // with a flat gain (range +5.2..+9.7), and -2.8dB with this trim (range -4.5..+0.1). The
+    // residual is TRILL_LOW_GAIN doing what it is for - the low note is meant to sit slightly
+    // proud, because at equal measured level the higher note is the one you hear.
+    function trillTiltRatio(lowHz, highHz) {
+      return (tiltCompensation(lowHz) / tiltCompensation(highHz)) * TRILL_LOW_GAIN;
     }
 
     // 1.0 well away from the duck, 0.0 once it is aimed at. Smoothstep rather than a step,
@@ -1969,8 +2101,32 @@
       mod.connect(modDepth);
       modDepth.connect(carrier.frequency);
 
+      // The trill. `trill` runs the +/-1 square at the alternation rate; `trillDepth` scales
+      // it into "how many Hz above the low note" (updateVoice sets that to highHz - lowHz),
+      // and it lands on carrier.frequency alongside the FM modulator. So the carrier's
+      // frequency is (low note) + (0 or the interval) + (FM wobble), which is one note or the
+      // other with the timbre intact on both - rather than two oscillators being crossfaded,
+      // which would need twice the nodes and would beat against itself at the handover.
+      //
+      // trillLevel does the same job for amplitude: the same square, scaled so the low half
+      // of the alternation is trillTiltRatio() louder than the high half. It is summed into a
+      // gain node's .gain, so the offset (the voice's actual level, set by updateVoice) and
+      // the per-note trim add rather than multiply.
+      const trill = context.createBufferSource();
+      trill.buffer = getTrillTable();
+      trill.loop = true;
+      const trillDepth = context.createGain();
+      trillDepth.gain.value = 0;
+      trill.connect(trillDepth);
+      trillDepth.connect(carrier.frequency);
+
+      const trillLevel = context.createGain();
+      trillLevel.gain.value = 0;
+      trill.connect(trillLevel);
+
       const tone = context.createGain();
       tone.gain.value = 0;        // silent until the first update fades it in
+      trillLevel.connect(tone.gain);
       const airFilter = context.createBiquadFilter();
       airFilter.type = "lowpass";
       airFilter.frequency.value = 16000;
@@ -1980,6 +2136,7 @@
 
       const voice = {
         id, context, timbre, carrier, mod, modDepth, tone, airFilter,
+        trill, trillDepth, trillLevel,
         started: false, stopping: false,
         irName: null, activeConv: "A", convA: null, convB: null, gainA: null, gainB: null,
         panner: null,
@@ -2089,6 +2246,7 @@
       if (first) {
         voice.carrier.start();
         voice.mod.start();
+        voice.trill.start();
         voice.started = true;
       }
       const setPitch = (param, value) => {
@@ -2097,9 +2255,21 @@
       };
       // Pitch in semitones rather than Hz, so the rise sounds evenly paced rather than
       // bunched up at the bottom.
+      const near = Math.max(0, Math.min(1, closeness));
       const octaves = Math.log2(TONE_MAX_HZ / TONE_MIN_HZ);
-      const hz = TONE_MIN_HZ * Math.pow(2, octaves * Math.max(0, Math.min(1, closeness)));
+      const hz = TONE_MIN_HZ * Math.pow(2, octaves * near);
+      const highHz = hz * voice.timbre.interval;
+      // The carrier sits on the LOW note and the trill square adds the interval on top, so
+      // the pair is (hz, highHz). Both notes therefore inherit the same glide, which is what
+      // keeps the interval fixed while the pitch sweeps.
       setPitch(voice.carrier.frequency, hz);
+      setPitch(voice.trillDepth.gain, highHz - hz);
+      // Alternation rate rides closeness too - a faster trill nearer the duck. Set on
+      // playbackRate rather than by restarting the source, so the square keeps its phase and
+      // no note is ever cut short mid-alternation.
+      setPitch(voice.trill.playbackRate,
+               trillRate(context, TONE_TRILL_MIN_HZ +
+                         (TONE_TRILL_MAX_HZ - TONE_TRILL_MIN_HZ) * near));
       // Modulator tracks the carrier so the timbre stays put as the pitch sweeps, and the
       // depth is index * modulator frequency (the standard FM definition of index).
       const modHz = hz * voice.timbre.ratio;
@@ -2112,12 +2282,25 @@
       const lock = lockEnvelope(closeness, locked);
       // Only the convolver path has the low-frequency shortfall; the PannerNode fallback is
       // roughly flat, so compensating there would make a far-away crosshair 16dB too loud.
+      // Referenced to the low note, since that is what the carrier sits on; the high note's
+      // share of the correction is the ratio applied below.
       const tilt = voice.panner ? 1 : tiltCompensation(hz);
       const level =
         TONE_PEAK_GAIN * tilt * (0.55 + 0.45 * closeness) * (share == null ? 1 : share) * lock;
+      // `level` is the mean of the two notes; the square swings the gain either side of it so
+      // the low note comes out `ratio` times the high one. The square is +1 on the half that
+      // trillDepth pushes UP to the high note, so with gain = level + trim*square, solving
+      // (level - trim)/(level + trim) = ratio gives trim = level * (1-ratio)/(1+ratio) -
+      // negative for ratio > 1, i.e. the high note is the one trimmed down. On the panner path
+      // the IR tilt is absent, so only the perceptual TRILL_LOW_GAIN part applies.
+      const ratio = voice.panner
+        ? TRILL_LOW_GAIN
+        : trillTiltRatio(hz, highHz);
+      const trim = level * ((1 - ratio) / (1 + ratio));
       voice.tone.gain.setTargetAtTime(
         level, now, lock < 1 ? TONE_LOCK_MS / 1000 : glide
       );
+      voice.trillLevel.gain.setTargetAtTime(trim, now, glide);
       const depth = Math.min(1, vector.dist);
       voice.airFilter.frequency.setTargetAtTime(
         Math.max(1200, 16000 - depth * 11000), now, glide
@@ -2137,6 +2320,10 @@
       if (voice.started) {
         voice.carrier.stop(now + fade + 0.02);
         voice.mod.stop(now + fade + 0.02);
+        // The trill source drives tone.gain, so it has to outlive the fade-out - stopping it
+        // early would freeze the gain at whichever note it happened to be on and, worse,
+        // leave a DC offset on a node that is still passing audio.
+        voice.trill.stop(now + fade + 0.02);
       }
     }
 
@@ -2215,7 +2402,11 @@
       if (!voice) return null;
       return {
         hz: voice.carrier.frequency.value,
+        highHz: voice.carrier.frequency.value + voice.trillDepth.gain.value,
+        trillHz: (voice.trill.playbackRate.value * voice.context.sampleRate)
+          / TRILL_TABLE_SAMPLES,
         gain: voice.tone.gain.value,
+        trillTrim: voice.trillLevel.gain.value,
         irName: voice.irName,
         spatializer: voice.panner ? "panner" : "convolver",
       };

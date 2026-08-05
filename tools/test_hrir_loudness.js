@@ -216,18 +216,45 @@ console.log("\nA narrowband tone survives the IRs' weak low end");
   )();
   const peak = Number((js.match(/const TONE_PEAK_GAIN = ([\d.]+)/) || [])[1]);
   const swell = (c) => 0.55 + 0.45 * c;   // mirrors updateVoice
+  // The voice is a two-note trill, not one carrier, so the model has to follow both notes:
+  // TONE_MIN_HZ..TONE_MAX_HZ bounds the LOW note only, and the high note sits `interval`
+  // above it, which puts the real span at 196..746Hz for P1. Modelling the carrier alone
+  // would report a flatness the player never hears, because half of every alternation is at
+  // a frequency these IRs treat completely differently.
+  const lowGain = Number((js.match(/const TRILL_LOW_GAIN = ([\d.]+)/) || [])[1]);
+  const interval = Number(
+    (js.match(/\{ratio: 1, index: [\d.]+, carrier: "sine", interval: ([\d.]+)\}/) || [])[1]
+  );
+  check("the P1 trill interval and TRILL_LOW_GAIN are readable",
+        interval > 1 && lowGain > 1, `interval ${interval}, low-note gain ${lowGain}`);
   // closeness -> hz is the same octave interpolation updateVoice uses.
   const hzAt = (c) => minHz * Math.pow(2, Math.log2(maxHz / minHz) * c);
+  // updateVoice asks for `level` on the tone gain and adds `trim * square` to it, so the two
+  // notes are requested at level-trim (low) and level+trim (high). Reproduced here exactly.
   const levels = [0, 0.2, 0.4, 0.6, 0.8].map((c) => {
-    const f = hzAt(c);
-    return {c, hz: f, out: peak * tiltComp(f) * swell(c) * delivered(f)};
+    const lo = hzAt(c), hi = hzAt(c) * interval;
+    const level = peak * tiltComp(lo) * swell(c);
+    const ratio = (tiltComp(lo) / tiltComp(hi)) * lowGain;
+    const trim = level * ((1 - ratio) / (1 + ratio));
+    const outLo = (level - trim) * delivered(lo);
+    const outHi = (level + trim) * delivered(hi);
+    // What the ear integrates over one alternation, at the reference's measured 0.506 duty.
+    return {c, hz: lo, hi, outLo, outHi, out: Math.sqrt((outLo * outLo + outHi * outHi) / 2)};
   });
   const outs = levels.map((l) => l.out);
   const flat = db(Math.max(...outs) / Math.min(...outs));
   console.log("       after compensation: " +
-              levels.map((l) => `${Math.round(l.hz)}Hz ${db(l.out).toFixed(1)}dB`).join("  "));
+              levels.map((l) => `${Math.round(l.hz)}/${Math.round(l.hi)}Hz ` +
+                                `${db(l.out).toFixed(1)}dB`).join("  "));
   check("the compensated sweep is roughly level, so its far end is still audible",
         flat < 6, `${flat.toFixed(1)}dB spread across the sweep`);
+  // Within a single alternation the two notes must land at similar level too - a trill whose
+  // halves are 10dB apart stops reading as a trill and turns into one note with a tick on it.
+  const worst = Math.max(...levels.map((l) => Math.abs(db(l.outLo / l.outHi))));
+  console.log("       note balance within the trill: " +
+              levels.map((l) => `${db(l.outLo / l.outHi).toFixed(1)}dB`).join("  "));
+  check("both notes of the trill arrive at a comparable level", worst < 8,
+        `worst imbalance ${worst.toFixed(1)}dB`);
   check("compensation only ever boosts (never attenuates below the reference)",
         [minHz, 400, maxHz].every((f) => tiltComp(f) >= 1 - 1e-9),
         [minHz, 400, maxHz].map((f) => tiltComp(f).toFixed(2)).join(","));
@@ -248,8 +275,13 @@ console.log("\nA narrowband tone survives the IRs' weak low end");
   check("...and the tone cannot exceed the game's own sounds even with sidebands added",
         Math.max(...outs) < QUACK_REQUEST, Math.max(...outs).toFixed(3));
 
-  // Regression guard on the specific values that shipped silent.
-  check("TONE_PEAK_GAIN is not back at the value that shipped inaudible", peak > 0.16,
+  // Regression guard on the specific values that shipped silent. The floor used to be 0.16,
+  // set when the voice was one held note; the trill deliberately went below it, to 0.13. Two
+  // notes alternating at 7-13Hz read considerably louder than either note held at the same
+  // gain - the alternation keeps re-triggering attention where a steady tone fades into the
+  // background - so equal gain would have put the cue over the game's own sounds. The floor
+  // is kept as a guard against a slip back toward zero, just at the trill's own level.
+  check("TONE_PEAK_GAIN is not back at the value that shipped inaudible", peak > 0.1,
         String(peak));
   // The flat path must not get the correction: it has no shortfall to correct.
   check("the PannerNode fallback is exempt from the tilt (it is already flat)",

@@ -2,19 +2,28 @@
 """
 把 repo 根目錄的來源檔打包回 index.pck，並同步 index.html 的 fileSizes。
 
-目前會替換三個資源：
+目前會替換四個資源：
     gripball_webhid.js       → res://web/gripball_webhid.js
     duck.gd.reference        → res://scenes/duck.gd
     gripball_input.gd.reference → res://scenes/gripball_input.gd
+    main.gd.reference        → res://scenes/main.gd
 
 用法：
-    python tools/patch_pck.py
+    python tools/patch_pck.py [目標目錄]
+
+    目標目錄預設是 repo 根目錄，也就是線上正式版。想先做預覽版就指定子目錄：
+
+        python tools/patch_pck.py preview
+
+    來源檔一律讀 repo 根目錄的那一份（單一來源），只有輸出的 index.pck /
+    index.html 會落在目標目錄。所以「根目錄的來源檔比根目錄的 index.pck 新」
+    是正常狀態：正式版被凍結在某個版本，來源檔繼續往前走，預覽版才跟上。
 
 流程：
     1. 讀取上面每一個來源檔（缺檔就跳過該項，不會失敗）
-    2. 取代 index.pck 內對應的資源
+    2. 取代目標目錄 index.pck 內對應的資源
     3. 重算該檔的 offset / size / md5，並重排後續檔案
-    4. 更新 index.html 裡 GODOT_CONFIG.fileSizes["index.pck"]
+    4. 更新目標目錄 index.html 裡 GODOT_CONFIG.fileSizes["index.pck"]
     5. 驗證：重新解析新 pck，逐檔比對「沒被替換的檔案」是否 byte-for-byte 一致
 
 備註：Godot 4 執行時不會驗證 pck 內各檔的 md5，但這裡還是照規格重算，
@@ -29,14 +38,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PCK = ROOT / "index.pck"
-HTML = ROOT / "index.html"
+# 來源檔永遠讀根目錄；輸出目錄由命令列決定（預設根目錄 = 線上正式版）。
+TARGET = (ROOT / sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT
+PCK = TARGET / "index.pck"
+HTML = TARGET / "index.html"
 # 來源檔 → pck 內資源路徑。.gd 檔在 repo root 都加 .reference 後綴，
 # 免得 Godot 專案或編輯器把 root 的 .gd 誤認成專案檔。
 REPLACEMENTS = {
     "gripball_webhid.js": "res://web/gripball_webhid.js",
     "duck.gd.reference": "res://scenes/duck.gd",
     "gripball_input.gd.reference": "res://scenes/gripball_input.gd",
+    "main.gd.reference": "res://scenes/main.gd",
 }
 ALIGN = 16
 
@@ -186,6 +198,10 @@ def update_html(new_size):
 
 
 def main():
+    if not PCK.exists():
+        raise SystemExit(f"找不到 {PCK}（目標目錄要先有一份完整的 web export）")
+    if TARGET != ROOT:
+        print(f"目標目錄：{TARGET.relative_to(ROOT)}/（根目錄的正式版不會被動到）\n")
     data = PCK.read_bytes()
     pck = parse(data)
     originals = [dict(e) for e in pck["entries"]]

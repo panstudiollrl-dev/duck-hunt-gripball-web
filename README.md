@@ -96,13 +96,33 @@ HRIR 卷積：`assets/hrir/` 內是 344 個 48kHz stereo IR（方位角一圈 ×
 
 瀏覽器不支援或 IR 還沒載到時，會自動退回內建的 `PannerNode` HRTF，不會沒聲音。
 
+### 瞄準音與失敗音
+
+兩者都以 `Duck_Sound_Deisgn/` 的參考錄音為模型，實測參數而不是憑耳朵抓。
+
+**瞄準音**（模型：`Crosshair_01.wav`）是一組兩音來回的顫音，掛在準心上：準心越靠近鴨子，
+音高越高、顫得越快；鎖定的瞬間**收成靜音**，讓「對準了」變成一個事件而不是一個持續音。
+參考錄音量到的是 253.2Hz / 481.8Hz（比例 1.903）、每 56ms 換一次音（8.9Hz、50/50），
+振幅平坦，而且 99.6% 的能量只落在那兩個音的頻帶裡 —— 幾乎是純正弦，所以 FM 的調變量壓得
+很低（1.6..4 → 0.35..0.9），不然會多出參考錄音沒有的簧片感。顫音本身用一張 ±1 的 buffer
+loop 當控制訊號，不用 `OscillatorNode` 的 square：band-limited square 在轉折處會過衝振鈴，
+拿來當**音高**控制的話每次換音都變成一聲 chirp。四位玩家各有自己的音色與音程。
+
+**失敗音**（模型：`Didn't_Hit_00.wav`）在打空時響，位置放在**準心**而不是鴨子身上 ——
+它回答的是「你這一槍去了哪裡」，從鴨子的方向響出來反而像打中了卻沒算分。同樣走 HRIR 卷積，
+Party Mode 下四個人各有自己的音高，同時開槍才分得出是誰。
+
+音高與音量的推導都寫在 `gripball_webhid.js` 的註解裡（含 IR 低頻不足要補多少 dB 的實測），
+`tools/test_tracking_tone.js`、`tools/test_hrir_loudness.js`、`tools/test_shot_miss.js` 有守。
+
 技術來源與更多細節見 `docs/SPATIAL_AUDIO.md`。
 
 ## 開發工具
 
 ```bash
-# 改完 gripball_webhid.js 或 duck.gd.reference 之後，重新打包進 index.pck
-python3 tools/patch_pck.py
+# 改完 gripball_webhid.js 或 *.gd.reference 之後，重新打包進 index.pck
+python3 tools/patch_pck.py          # 打包到根目錄（正式版）
+python3 tools/patch_pck.py preview  # 只打包到 preview/（正式版不動）
 
 # 測試（純 Node，不需要瀏覽器或 Godot）
 node tools/test_source_vector.js   # 螢幕座標 → 左右定位
@@ -110,6 +130,7 @@ node tools/test_hrir_mapping.js    # 角度挑選，用 IR 實測的 ITD/ILD 當
 node tools/test_spatial_graph.js   # Web Audio 節點圖與退回機制
 node tools/test_hrir_loudness.js   # 音量補償（方向造成的 + 頻率造成的）
 node tools/test_tracking_tone.js   # 準心追蹤音的音高／空間位置／收尾
+node tools/test_shot_miss.js       # 失敗音效：素材本身、定位、以及命中不該響
 node tools/test_quick_start.js     # 不校正的起始流程與固定門檻
 node tools/test_auto_start.js      # 自動開始的時序／競態，與控制列的顯示規則
 node tools/test_calibration_release.js  # 舊的三輪校正流程（仍是備用路徑）
@@ -118,8 +139,19 @@ node tools/test_calibration_release.js  # 舊的三輪校正流程（仍是備�
 `test_quick_start.js` 會印出門檻的可達性警告：如果設定的門檻超過實測球的量程，它不會
 讓測試失敗（門檻是 Pan 的決定），但會大聲印出來並建議一個數字。
 
-`duck.gd.reference` 是 `res://scenes/duck.gd` 的來源檔（該檔只存在於 `index.pck`
-裡），要改遊戲邏輯請改它再跑 `patch_pck.py`。
+`duck.gd.reference`、`gripball_input.gd.reference`、`main.gd.reference` 是
+`res://scenes/` 下對應 `.gd` 的來源檔（那些檔只存在於 `index.pck` 裡），要改遊戲邏輯
+請改它們再跑 `patch_pck.py`。
+
+### 兩份輸出：根目錄是正式版，`preview/` 是試玩版
+
+`preview/` 是一份完整、可獨立執行的 web export（`index.html` 裡所有路徑都是相對的，
+所以放在子目錄就能跑）。新的音效先只進 `preview/`，根目錄的 `index.pck` / `index.html`
+維持 byte-for-byte 不動，線上正式版就不會被影響。
+
+`patch_pck.py` 兩邊讀的都是根目錄的來源檔，只有輸出位置不同。也就是說「根目錄來源檔比
+根目錄 index.pck 新」是正常狀態：正式版凍結在某一版，來源檔繼續走，`preview/` 才跟上。
+試玩滿意之後要上線，就跑一次不帶參數的 `patch_pck.py`。
 
 ## GitHub Pages
 

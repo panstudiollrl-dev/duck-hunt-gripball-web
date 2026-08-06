@@ -73,8 +73,11 @@ var intro_continue_done := false
 # Started when the first player hits their intro duck; see INTRO_PARTY_GRACE_SEC.
 var intro_grace_timer: SceneTreeTimer = null
 # True while the dog is up presenting a duck. There is one dog node, so overlapping runs would
-# fight over its position; see _present_hit_duck_async.
+# fight over its position; see _drain_dog_present_queue.
 var dog_presenting := false
+# Hit ducks waiting for the dog, oldest first. There is one dog and four players, so several
+# ducks can land while it is already up; each entry is {"position", "type", "queued_at"}.
+var dog_present_queue: Array = []
 var party_player_count := 0
 var party_mode := false
 var party_spawning_players := {}
@@ -139,6 +142,13 @@ const INTRO_PARTY_TIMEOUT_SEC = 20.0
 # starts. Much shorter than the full timeout: one duck down proves the input path works, so
 # anybody still missing is a hardware problem, not a player taking their time.
 const INTRO_PARTY_GRACE_SEC = 8.0
+# A queued duck older than this does not get a dog. The retrieval reads as "the dog is fetching
+# the duck you just shot", and that reading has a shelf life: with one dog and four players a
+# queue can build up, and coming up half a round later - after the duck has long gone and other
+# ducks have been shot - is exactly the 不對的時間點 / 根本就不是我們打到的鴨子 Pan reported
+# (2026-08-06). Late entries are dropped rather than shown, because no dog is better than a dog
+# holding a duck nobody remembers shooting.
+const DOG_PRESENT_MAX_AGE_SEC = 2.5
 
 
 # Shuffle bag for duck types to increase "randomness feel"
@@ -209,7 +219,7 @@ func _ready():
 		# Only the retrieval, though. play_dog_intro is the sniff-and-jump that runs BEFORE the
 		# first duck and is awaited by _ready(), which would hold four players on a static screen
 		# for ~7s with nothing to do; the retrieval is a ~1.7s reaction to something they just
-		# did, and in Party Mode it does not block anybody (see _present_hit_duck_async).
+		# did, and in Party Mode it does not block anybody (see _drain_dog_present_queue).
 		play_dog_intro = false
 		present_hit_duck = true
 		max_bullets = maxi(max_bullets, party_player_count * 99)
@@ -288,6 +298,8 @@ func _show_highscore_screen():
 		_online_str = " online "
 	print("Showing" + _online_str + "highscore screen")
 	ignore_shots = true
+	# Anything still waiting for the dog belongs to a game that is now over.
+	dog_present_queue.clear()
 	if duck:
 		duck.queue_free()
 	for _player_id in party_ducks.keys():
@@ -493,6 +505,9 @@ func _spawn_party_intro_ducks():
 		if player_id == 0:
 			duck = intro_duck
 		intro_duck.name = "IntroDuckPlayer" + str(player_id + 1)
+		# Marks this duck as belonging to the title card, so a next_duck emitted after the screen
+		# is hidden can be told apart from a real in-round duck - see _on_next_duck.
+		intro_duck.set_meta("intro_duck", true)
 		intro_duck.show()
 		intro_duck.velocity = Vector2.ZERO
 		var _duck_width = ceil(intro_duck.get_node("CollisionShape2D").get_shape().get_rect().size.x)
@@ -665,15 +680,43 @@ func _dog_laugh():
 
 
 # Party Mode's route into _dog_present_duck. Fire-and-forget on purpose - see the call site in
-# _on_next_duck - and single-flight, because there is one dog: two ducks landing at once would
+# _on_next_duck - and serialised, because there is one dog: two ducks landing at once would
 # otherwise both reposition and re-show the same node, and the second would cut the first off
 # mid-slide and leave the dog stranded (its own animation restores position, so an interrupted
 # run does not restore it).
-func _present_hit_duck_async(_duck_hit_position, _duck_type) -> void:
+#
+# Ducks that land while the dog is busy wait their turn instead of being dropped, but only
+# briefly - see DOG_PRESENT_MAX_AGE_SEC. A dog that comes up long after the fact is showing a
+# duck the player has stopped thinking about, which is worse than no dog at all.
+func _queue_hit_duck_for_dog(_duck_hit_position, _duck_type) -> void:
+	dog_present_queue.append({
+		"position": _duck_hit_position,
+		"type": _duck_type,
+		"queued_at": Time.get_ticks_msec() / 1000.0,
+	})
+	if dog_presenting:
+		return
+	_drain_dog_present_queue()
+
+
+func _drain_dog_present_queue() -> void:
 	if dog_presenting:
 		return
 	dog_presenting = true
-	await _dog_present_duck(_duck_hit_position, _duck_type)
+	while not dog_present_queue.is_empty():
+		var entry: Dictionary = dog_present_queue.pop_front()
+		# Age is measured from the hit, not from reaching the front of the queue, so a backlog
+		# expires rather than replaying itself in slow motion.
+		var age := (Time.get_ticks_msec() / 1000.0) - float(entry.get("queued_at", 0.0))
+		if age > DOG_PRESENT_MAX_AGE_SEC:
+			print("Skipping dog retrieval, duck was shot " + str(snappedf(age, 0.1)) + "s ago")
+			continue
+		# Nothing to present once the round is over or the board has been torn down: the dog
+		# would be climbing out of the grass over the game over sign or the highscore screen.
+		if not game_over_timer.is_stopped() or intro_screen.visible:
+			dog_present_queue.clear()
+			break
+		await _dog_present_duck(entry.get("position"), entry.get("type"))
 	dog_presenting = false
 
 
@@ -843,6 +886,22 @@ func _add_party_player_label(target_duck, player_id: int) -> void:
 # Function connected to "next_duck" signal from Duck scene
 func _on_next_duck(source_duck = null, player_id := -1):
 	var active_duck = duck if source_duck == null else source_duck
+	if active_duck.has_meta("intro_duck") and not intro_screen.visible:
+		# The intro ducks are children of intro_screen, and hiding it trips their
+		# VisibleOnScreenNotifier2D - _exit_intro_screen() says as much in its own comment. So
+		# every intro duck emits next_duck one last time, AFTER intro_screen.visible has already
+		# gone false, and those emissions used to fall straight through into the gameplay
+		# branches below: they scored points, advanced ducks_shot, queued a respawn, and sent
+		# the dog up holding an intro duck at the exact moment the round began.
+		#
+		# That is the dog Pan saw (2026-08-06: 狗都在不對的時間點爬出來 根本就不是我們打到的鴨子).
+		# It was never showing the duck they had just shot in the round - it was showing the
+		# title-card duck from before the game started.
+		#
+		# Single player is unaffected and must stay that way: there the intro duck falls off the
+		# bottom of the screen while the card is still up, and that emission is what continues
+		# the game (see the elif below). Hence the visible check rather than a blanket return.
+		return
 	var _duck_hit_position = active_duck.duck_hit_position
 	var _duck_type = active_duck.current_duck_type
 	if party_mode and player_id >= 0:
@@ -851,17 +910,17 @@ func _on_next_duck(source_duck = null, player_id := -1):
 		party_spawning_players.erase(player_id)
 		if not intro_screen.visible:
 			if active_duck.duck_hit:
+				# Queue the dog BEFORE the scoreboard await. _increase_ducks_shot() waits 0.5s
+				# (1s on the last duck of a round), and queuing after it put the dog that much
+				# further from the moment of the hit for no reason.
+				#
+				# Deliberately not awaited: in Party Mode every player has their own duck and
+				# their own respawn clock, so waiting out a ~1.7s animation would stall that
+				# player's next duck, and with four players stall it repeatedly.
+				if present_hit_duck:
+					_queue_hit_duck_for_dog(_duck_hit_position, _duck_type)
 				await _increase_ducks_shot()
 				score_current += points_per_duck
-				# The dog comes up out of the grass holding the duck. Deliberately NOT awaited
-				# here: in Party Mode every player has their own duck and their own respawn
-				# clock, so waiting out a ~1.7s animation would stall that player's next duck
-				# and, with four players, stall it repeatedly. _present_hit_duck_async also
-				# declines if the dog is already up, since there is one dog and it can only be
-				# in one place - so with several ducks landing together the first one gets the
-				# dog and the rest just respawn.
-				if present_hit_duck:
-					_present_hit_duck_async(_duck_hit_position, _duck_type)
 			await get_tree().create_timer(0.45).timeout
 			if game_over_timer.is_stopped():
 				await _spawn_duck(player_id)
@@ -1026,6 +1085,9 @@ func _input(event):
 
 func _game_over():
 	print("\nGAME OVER!")
+	# The dog is about to laugh, which moves the same node. Any retrieval still queued would
+	# fight it for position, and it is answering a hit from the game that just ended.
+	dog_present_queue.clear()
 	_dog_laugh()
 	game_over_sign.show()
 	game_over_player.play()

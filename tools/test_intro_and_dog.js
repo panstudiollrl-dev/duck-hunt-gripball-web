@@ -190,26 +190,80 @@ console.log("\nThe dog still retrieves the duck");
   check("_dog_present_duck is still present", Boolean(func(main, "_dog_present_duck")));
 
   const next = func(main, "_on_next_duck");
-  check("the party branch now calls it", /_present_hit_duck_async\(_duck_hit_position, _duck_type\)/.test(next),
+  check("the party branch now calls it", /_queue_hit_duck_for_dog\(_duck_hit_position, _duck_type\)/.test(next),
         "the party branch returned before ever reaching the single-player call");
   check("...only for a duck that was actually hit",
-        /if active_duck\.duck_hit:[\s\S]{0,400}_present_hit_duck_async/.test(next));
+        /if active_duck\.duck_hit:[\s\S]{0,600}_queue_hit_duck_for_dog/.test(next));
   check("...and gated on present_hit_duck, so the flag still means something",
-        /if present_hit_duck:\s*\n\s*_present_hit_duck_async/.test(next));
+        /if present_hit_duck:\s*\n\s*_queue_hit_duck_for_dog/.test(next));
   // The await is the trap here: in party mode each player has their own respawn clock, so
   // awaiting a ~1.7s animation would stall that player's next duck every single time.
   check("it is not awaited, so it cannot stall a player's next duck",
-        !/await _present_hit_duck_async/.test(next),
+        !/await _queue_hit_duck_for_dog/.test(next),
         "awaiting this in party mode delays every respawn by the animation length");
+  // Ordering: _increase_ducks_shot() awaits 0.5s (1s on a round's last duck), so queuing after
+  // it pushes the dog that much further from the hit it is supposed to be answering.
+  check("the dog is queued before the scoreboard delay, not after",
+        next.indexOf("_queue_hit_duck_for_dog") < next.indexOf("await _increase_ducks_shot()"),
+        "queuing after the await adds 0.5-1s of lag to a cue about a specific moment");
 
-  const async = func(main, "_present_hit_duck_async");
-  check("_present_hit_duck_async exists", Boolean(async));
+  const queue = func(main, "_queue_hit_duck_for_dog");
+  check("_queue_hit_duck_for_dog exists", Boolean(queue));
+  check("it records when the duck was hit",
+        /"queued_at": Time\.get_ticks_msec\(\) \/ 1000\.0/.test(queue),
+        "without a timestamp a backlog cannot be told from a fresh hit");
+  check("...and does not start a second drain while one is running",
+        /if dog_presenting:\s*\n\s*return\s*\n\s*_drain_dog_present_queue\(\)/.test(queue));
+
+  const drain = func(main, "_drain_dog_present_queue");
+  check("_drain_dog_present_queue exists", Boolean(drain));
   check("it is single-flight, because there is only one dog",
-        /if dog_presenting:\s*\n\s*return/.test(async),
+        /if dog_presenting:\s*\n\s*return/.test(drain),
         "two overlapping runs fight over dog_node.position and strand the dog");
-  check("...and clears the flag afterwards, so the second duck gets a dog",
-        /await _dog_present_duck\([\s\S]*?dog_presenting = false/.test(async));
-  check("the flag is declared", /var dog_presenting := false/.test(main));
+  check("...and clears the flag afterwards, so the next duck gets a dog",
+        /dog_presenting = false/.test(drain));
+  // The actual complaint: a dog that arrives late is holding a duck the player has stopped
+  // thinking about. Dropping the entry is the correct outcome, not deferring it further.
+  check("a stale duck is skipped rather than shown late",
+        /if age > DOG_PRESENT_MAX_AGE_SEC:[\s\S]{0,200}continue/.test(drain),
+        "this is 狗都在不對的時間點爬出來");
+  check("...with the age measured from the hit, not from reaching the queue front",
+        /var age := \(Time\.get_ticks_msec\(\) \/ 1000\.0\) - float\(entry\.get\("queued_at"/.test(drain),
+        "re-stamping on dequeue would let a backlog replay itself in slow motion");
+  check("the max age is short enough to still read as 'the duck you just shot'",
+        Number((main.match(/DOG_PRESENT_MAX_AGE_SEC = ([\d.]+)/) || [])[1]) <= 3.0);
+  check("nothing is presented over the game over sign or the highscore screen",
+        /if not game_over_timer\.is_stopped\(\) or intro_screen\.visible:/.test(drain));
+  check("the queue is dropped when the game ends",
+        /dog_present_queue\.clear\(\)/.test(func(main, "_game_over")) &&
+        /dog_present_queue\.clear\(\)/.test(func(main, "_show_highscore_screen")),
+        "a queued retrieval would fight _dog_laugh() for the same node");
+  check("the flag and the queue are declared",
+        /var dog_presenting := false/.test(main) && /var dog_present_queue: Array = \[\]/.test(main));
+}
+
+console.log("\nThe title card's ducks cannot score in the round that follows");
+{
+  // The root cause of the wrong-duck dog. intro_screen's children include the intro ducks, so
+  // hide() trips each duck's VisibleOnScreenNotifier2D and emits next_duck one last time - after
+  // intro_screen.visible has already gone false. Those emissions fell through into the gameplay
+  // branch: points, ducks_shot, a respawn, and a dog holding a title-card duck.
+  const next = func(main, "_on_next_duck");
+  check("an intro duck emitting after the screen is hidden is ignored",
+        /if active_duck\.has_meta\("intro_duck"\) and not intro_screen\.visible:[\s\S]{0,1400}\n\t\treturn\n/
+          .test(next),
+        "this is the dog that was 根本就不是我們打到的鴨子");
+  check("...checked before anything reads the duck's hit position",
+        next.indexOf('has_meta("intro_duck")') < next.indexOf("var _duck_hit_position"));
+  check("the party intro ducks carry that mark",
+        /set_meta\("intro_duck", true\)/.test(func(main, "_spawn_party_intro_ducks")));
+  // Single player relies on the opposite behaviour: its intro duck falls off the bottom of the
+  // screen while the card is still up, and that emission is what continues the game. A blanket
+  // return would break the single-player intro, so the guard is conditional on visible.
+  check("single player's intro duck still continues the game",
+        /not intro_screen\.visible/.test(next) &&
+        /elif intro_screen\.visible:/.test(next),
+        "the guard must not fire while the card is still showing");
 }
 
 console.log("\nmain.gd and gripball_input.gd actually ship");

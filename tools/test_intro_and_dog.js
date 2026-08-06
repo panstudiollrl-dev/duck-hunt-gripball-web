@@ -214,6 +214,31 @@ console.log("\nThe dog still retrieves the duck");
         "without a timestamp a backlog cannot be told from a fresh hit");
   check("...and does not start a second drain while one is running",
         /if dog_presenting:\s*\n\s*return\s*\n\s*_drain_dog_present_queue\(\)/.test(queue));
+  // Pan, 2026-08-06: 狗太常出來了 可以隨機的間歇式的偶爾出現就好. Rolling at queue time rather
+  // than in the drain means a declined duck never occupies the queue at all.
+  check("most hits are declined before anything is queued",
+        /if not _dog_should_present\(\):\s*\n\s*return\s*\n\s*dog_present_queue\.append/.test(queue),
+        "rolling inside the drain would let declines still block the gap check");
+
+  const should = func(main, "_dog_should_present");
+  check("_dog_should_present exists", Boolean(should));
+  check("it is an actual random roll, not every Nth duck",
+        /return randf\(\) < DOG_PRESENT_CHANCE/.test(should));
+  check("the chance is occasional rather than usual",
+        Number((main.match(/DOG_PRESENT_CHANCE = ([\d.]+)/) || [])[1]) <= 0.35,
+        "anything near 1.0 is the常態 Pan asked to get away from");
+  // A plain roll clusters: at 0.22 a pair of back-to-back dogs is common enough to read as
+  // broken rather than as random, which is what the gap floor is for.
+  check("a minimum gap keeps two dogs from landing back to back",
+        /now - dog_last_present_time < DOG_PRESENT_MIN_GAP_SEC/.test(should));
+  check("...and the first hit of a game is eligible",
+        /var dog_last_present_time := -1000\.0/.test(main),
+        "starting at 0 would make the gap apply before any dog had appeared");
+  // With four players several ducks land at once, so a win already queued has to close the gate
+  // too - otherwise two ducks in the same instant both pass and the dog goes twice.
+  check("a duck already queued blocks another from winning",
+        /if not dog_present_queue\.is_empty\(\):\s*\n\s*return false/.test(should));
+  check("...as does a retrieval already running", /if dog_presenting or/.test(should));
 
   const drain = func(main, "_drain_dog_present_queue");
   check("_drain_dog_present_queue exists", Boolean(drain));
@@ -222,6 +247,10 @@ console.log("\nThe dog still retrieves the duck");
         "two overlapping runs fight over dog_node.position and strand the dog");
   check("...and clears the flag afterwards, so the next duck gets a dog",
         /dog_presenting = false/.test(drain));
+  check("the gap is counted from when a retrieval ended, not when it started",
+        /dog_last_present_time = Time\.get_ticks_msec\(\) \/ 1000\.0/.test(drain) &&
+        drain.indexOf("await _dog_present_duck") < drain.indexOf("dog_last_present_time ="),
+        "stamping at the start would let the ~1.7s animation eat into the gap");
   // The actual complaint: a dog that arrives late is holding a duck the player has stopped
   // thinking about. Dropping the entry is the correct outcome, not deferring it further.
   check("a stale duck is skipped rather than shown late",

@@ -78,6 +78,9 @@ var dog_presenting := false
 # Hit ducks waiting for the dog, oldest first. There is one dog and four players, so several
 # ducks can land while it is already up; each entry is {"position", "type", "queued_at"}.
 var dog_present_queue: Array = []
+# When the last retrieval finished, for DOG_PRESENT_MIN_GAP_SEC. Negative so the first hit of a
+# game is eligible rather than having to wait out a gap that never happened.
+var dog_last_present_time := -1000.0
 var party_player_count := 0
 var party_mode := false
 var party_spawning_players := {}
@@ -149,6 +152,21 @@ const INTRO_PARTY_GRACE_SEC = 8.0
 # (2026-08-06). Late entries are dropped rather than shown, because no dog is better than a dog
 # holding a duck nobody remembers shooting.
 const DOG_PRESENT_MAX_AGE_SEC = 2.5
+# How often a hit duck gets the dog at all. Pan, 2026-08-06: 狗太常出來了 可以隨機的間歇式的
+# 偶爾出現就好.
+#
+# Once the queue was fixed the dog came up for essentially every kill, and with four players
+# that is a lot of kills - so what was meant as a little reward became the常態 and stopped
+# registering as one. It is a treat, and a treat has to be rare enough to notice.
+#
+# Note this is per hit duck, not per second: four players shooting means four rolls, so the dog
+# is seen roughly as often here as a single player at 4x the rate. DOG_PRESENT_MIN_GAP_SEC is
+# what keeps that from clustering.
+const DOG_PRESENT_CHANCE = 0.22
+# Even at 0.22 an unlucky run of rolls puts the dog up twice in a row, which reads as broken
+# rather than as random. Nothing is presented until this long after the last retrieval ended -
+# a floor on the gap, so "occasional" stays occasional in the short term as well as on average.
+const DOG_PRESENT_MIN_GAP_SEC = 12.0
 
 
 # Shuffle bag for duck types to increase "randomness feel"
@@ -685,10 +703,18 @@ func _dog_laugh():
 # mid-slide and leave the dog stranded (its own animation restores position, so an interrupted
 # run does not restore it).
 #
-# Ducks that land while the dog is busy wait their turn instead of being dropped, but only
-# briefly - see DOG_PRESENT_MAX_AGE_SEC. A dog that comes up long after the fact is showing a
-# duck the player has stopped thinking about, which is worse than no dog at all.
+# Most hits get no dog at all: see DOG_PRESENT_CHANCE. The roll happens here rather than in the
+# drain so that a duck the dog is not coming for never takes up a place in the queue, and so a
+# decline costs nothing and cannot delay the next duck that does win.
+#
+# With those gates in place the queue holds at most one entry - _dog_should_present() declines
+# while anything is queued or presenting - so DOG_PRESENT_MAX_AGE_SEC is now a backstop rather
+# than the load-bearing part it was when every hit queued. It stays because it is what stops a
+# dog answering a duck nobody remembers shooting, and it is the gates, not the age check, that
+# would have to be re-reasoned if the rarity ever changes.
 func _queue_hit_duck_for_dog(_duck_hit_position, _duck_type) -> void:
+	if not _dog_should_present():
+		return
 	dog_present_queue.append({
 		"position": _duck_hit_position,
 		"type": _duck_type,
@@ -697,6 +723,21 @@ func _queue_hit_duck_for_dog(_duck_hit_position, _duck_type) -> void:
 	if dog_presenting:
 		return
 	_drain_dog_present_queue()
+
+
+# Whether this hit duck gets the dog. Two gates: a minimum gap since the last retrieval, so two
+# dogs cannot land back to back, and then a plain random roll.
+#
+# The gap is checked against the queue as well as the last finished retrieval - with four players
+# several ducks can be in flight at once, and a win already sitting in the queue is a dog that
+# has not happened yet but is about to.
+func _dog_should_present() -> bool:
+	if not dog_present_queue.is_empty():
+		return false
+	var now := Time.get_ticks_msec() / 1000.0
+	if dog_presenting or now - dog_last_present_time < DOG_PRESENT_MIN_GAP_SEC:
+		return false
+	return randf() < DOG_PRESENT_CHANCE
 
 
 func _drain_dog_present_queue() -> void:
@@ -717,6 +758,9 @@ func _drain_dog_present_queue() -> void:
 			dog_present_queue.clear()
 			break
 		await _dog_present_duck(entry.get("position"), entry.get("type"))
+		# Stamped after the animation, so DOG_PRESENT_MIN_GAP_SEC is a gap between retrievals
+		# rather than between their start times (the animation is ~1.7s of that on its own).
+		dog_last_present_time = Time.get_ticks_msec() / 1000.0
 	dog_presenting = false
 
 

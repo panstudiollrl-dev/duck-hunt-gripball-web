@@ -49,6 +49,11 @@ var players_proven := {}
 # release. While set, the player emits no tone - the reward for arriving is silence, and the
 # next press is what buys a new sweep.
 var party_tone_spent := {}
+# player_id -> when their fire lock-out ends, in the same seconds-since-boot clock main.gd uses.
+# Set by set_player_locked() after a miss; while it holds, that crosshair dims and stops tracking.
+var party_locked_until := {}
+# player_id -> which duck main.gd last steered them at, so a change of target can re-arm the tone.
+var party_target_keys := {}
 var party_layer: CanvasLayer
 var status_label: Label
 var step_label: Label
@@ -232,6 +237,8 @@ func _setup_party_crosshairs(count: int) -> void:
 	party_positions.clear()
 	party_strengths.clear()
 	party_tone_spent.clear()
+	party_locked_until.clear()
+	party_target_keys.clear()
 	var size := get_viewport().get_visible_rect().size
 	for player_id in range(count):
 		var sprite := Sprite2D.new()
@@ -390,6 +397,14 @@ func _update_party_tracking(delta: float) -> void:
 		var sprite: Sprite2D = party_crosshairs[player_id]
 		var strength := float(party_strengths.get(player_id, 0.0))
 		var current: Vector2 = party_positions.get(player_id, sprite.position)
+		var locked := is_player_locked(player_id)
+		# Half-transparent while locked out. The crosshair also stops moving below, so the player
+		# both sees the penalty and feels it - squeezing does nothing until it lifts.
+		sprite.modulate.a = 0.35 if locked else 1.0
+		if locked:
+			party_positions[player_id] = current
+			sprite.position = current
+			continue
 		if strength <= TRACK_PRESS_FLOOR:
 			# Released: arm this player's next press. Per player, so one player letting go
 			# does not re-arm anybody else.
@@ -411,6 +426,17 @@ func _update_party_tracking(delta: float) -> void:
 		current = current.clamp(Vector2.ZERO, viewport_size)
 		party_positions[player_id] = current
 		sprite.position = current
+		# Re-arm on a change of target, even mid-squeeze. party_tone_spent exists so that one long
+		# hold cannot drone (the reward for arriving is silence), but with a shared flock the
+		# crosshair now gets handed a NEW duck without the player releasing - because they took
+		# the last one, or somebody else did. Staying silent through that approach would withhold
+		# the trill exactly when it is being used to time a contested shot.
+		var target_key := 0
+		if scene.has_method("_get_gripball_player_target_key"):
+			target_key = int(scene._get_gripball_player_target_key(player_id))
+		if target_key != int(party_target_keys.get(player_id, 0)):
+			party_target_keys[player_id] = target_key
+			party_tone_spent[player_id] = false
 		if current.distance_to(target) <= TRACK_LOCK_RADIUS:
 			party_tone_spent[player_id] = true
 		if not bool(party_tone_spent.get(player_id, false)):
@@ -422,6 +448,19 @@ func _update_party_tracking(delta: float) -> void:
 				"locked": false,
 			})
 	_send_track_tones(tones)
+
+
+# Called by main.gd when a miss costs this player their next second or so (PARTY_MISS_LOCK_SEC).
+#
+# The lock is enforced in main.gd - this is only how it is shown. A penalty the player cannot see
+# is indistinguishable from the game having lost their input, which is worse than no penalty: they
+# would go looking for a broken ball instead of learning to hold their shot.
+func set_player_locked(player_id: int, duration_sec: float) -> void:
+	party_locked_until[player_id] = (Time.get_ticks_msec() / 1000.0) + duration_sec
+
+
+func is_player_locked(player_id: int) -> bool:
+	return (Time.get_ticks_msec() / 1000.0) < float(party_locked_until.get(player_id, 0.0))
 
 
 func _is_on_duck(point: Vector2, duck: Node) -> bool:

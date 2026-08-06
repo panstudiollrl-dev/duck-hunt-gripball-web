@@ -191,9 +191,18 @@ console.log("\nA miss triggers it; a hit does not");
   check("it has a fallback for events with no position",
         /get_viewport\(\)\.get_mouse_position\(\)/.test(shotPos[0]));
 
-  // Party Mode: the miss is placed at the crosshair, not at the duck.
-  check("party mode plays the miss when the hitbox test fails",
-        /has_point\(collision\.to_local\(aim_position\)\):\s*\n\s*target_duck\.shoot\(\)\s*\n\s*else:[\s\S]{0,400}_play_web_shot_miss\(aim_position, player_id\)/
+  // Party Mode: the miss is placed at the crosshair, not at the duck. The hitbox test itself has
+  // moved into _party_duck_at(), which sweeps the whole shared flock - a shot is no longer looked
+  // up by the shooter at all (that gate was a bug; see test_intro_and_dog.js). So what matters
+  // here is that finding nothing still answers, and answers at the crosshair.
+  check("party mode plays the miss when nothing was under the crosshair",
+        /func _party_duck_at\([\s\S]*?has_point\(collision\.to_local\(aim_position\)\)/.test(main) &&
+        /var target_duck = _party_duck_at\(aim_position\)\s*\n\s*if target_duck:[\s\S]{0,900}\n\telse:\s*\n(?:\s*#[^\n]*\n)*\s*_play_web_shot_miss\(aim_position, player_id\)/
+          .test(main));
+  // Losing the race to another player is a miss as far as this cue goes: the shot did travel and
+  // did land on nothing scoreable, and silence there would read as a hit that failed to register.
+  check("...and when another player got to that duck first",
+        /if target_duck\.duck_hit:\s*\n(?:\s*#[^\n]*\n)*\s*_play_web_shot_miss\(aim_position, player_id\)/
           .test(main));
   // Intro screen: where the aim tone is heard for the first time.
   check("the intro screen answers misses too",

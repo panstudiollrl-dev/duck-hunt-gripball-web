@@ -64,7 +64,19 @@ signal intro_screen_continued
 @export var highscore_node: PackedScene
 var duck
 var highscore_screen
+# The shared flock, keyed by SLOT index (0..PARTY_SHARED_DUCK_COUNT-1) - NOT by player. Every
+# player shoots at every duck in here; see PARTY_SHARED_DUCK_COUNT for why it stopped being
+# one duck per player.
 var party_ducks := {}
+# player_id -> points. The global score_current still adds up everything (the highscore board is
+# a single number), but the contest needs to be legible while it is happening, so each player
+# also carries their own total.
+var party_scores := {}
+var party_score_labels := {}
+var party_hud_layer: CanvasLayer
+# Whether the score row is currently drawn with anybody greyed out. Lets _process() tell a lock
+# that has just expired from one that expired several frames ago.
+var party_scores_showing_lock := false
 var intro_party_ducks := {}
 var intro_players_hit := {}
 # Set once the intro screen has been left, by whichever route got there first. Guards against a
@@ -83,7 +95,15 @@ var dog_present_queue: Array = []
 var dog_last_present_time := -1000.0
 var party_player_count := 0
 var party_mode := false
+# Slot indices with a respawn already in flight, so two ducks leaving in the same frame cannot
+# both start filling the same slot.
 var party_spawning_players := {}
+# player_id -> the time their fire lock expires. Absent or in the past means they can shoot.
+# See PARTY_MISS_LOCK_SEC.
+var party_locked_until := {}
+# player_id -> instance id of the duck they are currently being steered at. See
+# _get_gripball_player_target_key.
+var party_target_keys := {}
 
 
 # General settings
@@ -168,6 +188,40 @@ const DOG_PRESENT_CHANCE = 0.22
 # a floor on the gap, so "occasional" stays occasional in the short term as well as on average.
 const DOG_PRESENT_MIN_GAP_SEC = 12.0
 
+# --- Contested ducks (Party Mode) ---------------------------------------------------------
+#
+# Pan, 2026-08-06: 目前有點太無聊 ... 或許可以設計讓遊戲比較有競爭 比較有趣的機制.
+#
+# The reason it was boring was structural, not cosmetic: every player had their own duck, their
+# own respawn clock and their own lane, so four players were playing four separate single-player
+# games side by side. Nothing any of them did could affect anybody else, so there was nothing to
+# compete over. Now there is one small flock and everyone shoots at it - first to hit a duck
+# scores it, and everybody else's shot at that duck is wasted.
+#
+# Pan's follow-up question was the right one to ask of that design: 瞄準是自動的 那競爭標準在哪裡
+# - if aiming is automatic, what is the contest? Automatic tracking removes ACCURACY, not
+# competition. What is left to be better at:
+#
+#   1. How hard you squeeze. Tracking speed scales with grip strength, and estimateGrip() scales
+#      it against each ball's OWN measured range (pressPeak), so this axis is "what fraction of
+#      your strength" rather than "how many newtons" - a child and an adult can both reach 1.0.
+#      This is also the axis the grip trainer exists to exercise.
+#   2. When you flick. Tracking only brings the crosshair into range; the aim trill going silent
+#      is what says a shot would land right now. Too early is a miss, too late and it is gone.
+#   3. Which duck you go for. Tracking locks onto the duck NEAREST that player's crosshair, so
+#      where your last shot left you decides what you can contest next. Two players converging
+#      on the same duck is a race one of them should have declined.
+#   4. Not wasting shots - see PARTY_MISS_LOCK_SEC.
+const PARTY_SHARED_DUCK_COUNT = 2
+# What a miss costs. Without a cost, shots are free and the correct strategy is to flick as fast
+# as the cooldown allows, which would collapse every one of the four axes above into a
+# button-mashing contest and make the shared flock worse than what it replaced.
+#
+# A lock-out rather than a score penalty: it is immediate, it is visible (the crosshair greys
+# out), it punishes exactly the mash strategy, and it cannot snowball a losing player into a
+# hole they stop trying to climb out of - which negative scores and a finite magazine both do.
+const PARTY_MISS_LOCK_SEC = 1.2
+
 
 # Shuffle bag for duck types to increase "randomness feel"
 # by preventing the same duck type of getting picked directly after each other
@@ -241,6 +295,7 @@ func _ready():
 		play_dog_intro = false
 		present_hit_duck = true
 		max_bullets = maxi(max_bullets, party_player_count * 99)
+		_create_party_score_hud()
 	### Quick debug mode
 	if quick_debug_mode:
 		print("\nATTENTION: Quick debug mode enabled!\n")
@@ -297,6 +352,17 @@ func _apply_audio_mix() -> void:
 
 # Called every frame. 'delta' is the elapsed time since the previous frame.
 func _process(_delta):
+	# A lock expiring is not an event anybody emits, so the greyed-out score has to be un-greyed
+	# by polling. Only when something has actually changed: the override churns theme lookups.
+	if party_mode and not party_score_labels.is_empty():
+		var any_locked := false
+		for player_id in party_score_labels.keys():
+			if _party_is_locked(player_id):
+				any_locked = true
+				break
+		if any_locked != party_scores_showing_lock:
+			party_scores_showing_lock = any_locked
+			_refresh_party_scores()
 	if time_start > 0:
 		time_now = Time.get_unix_time_from_system()
 		time_elapsed = time_now - time_start
@@ -320,11 +386,15 @@ func _show_highscore_screen():
 	dog_present_queue.clear()
 	if duck:
 		duck.queue_free()
-	for _player_id in party_ducks.keys():
-		var _party_duck = party_ducks[_player_id]
+	for _slot_id in party_ducks.keys():
+		var _party_duck = party_ducks[_slot_id]
 		if is_instance_valid(_party_duck):
 			_party_duck.queue_free()
 	party_ducks.clear()
+	# The per-player row goes with info_elements below. Leaving it up would put a live-looking
+	# scoreboard over the highscore screen, which shows a different number entirely.
+	if is_instance_valid(party_hud_layer):
+		party_hud_layer.hide()
 	highscore_screen = highscore_node.instantiate()
 	# Runs _ready() of HighscoreScreen()
 	get_tree().current_scene.add_child(highscore_screen)
@@ -552,6 +622,8 @@ func _exit_intro_screen():
 	# (signal screen_exited())!
 	intro_screen.hide()
 	info_elements.show()
+	if is_instance_valid(party_hud_layer):
+		party_hud_layer.show()
 	version_label.hide()
 	print("Leaving intro screen...")
 
@@ -835,25 +907,27 @@ func _dog_present_duck(_duck_hit_position, _duck_type):
 #
 # Attention:
 # Assumes that TopEdgeGrass'es CollisionShape2D has one_way_collision enabled!
-func _spawn_duck(player_id := -1):
-	if player_id >= 0:
-		var existing_duck = party_ducks.get(player_id)
+# In Party Mode the argument is a SLOT in the shared flock, not a player. Nobody owns a duck any
+# more, so there is nothing player-shaped left to key it by - see PARTY_SHARED_DUCK_COUNT.
+func _spawn_duck(slot_id := -1):
+	if slot_id >= 0:
+		var existing_duck = party_ducks.get(slot_id)
 		if existing_duck and is_instance_valid(existing_duck):
 			return existing_duck
-		if party_spawning_players.get(player_id, false):
+		if party_spawning_players.get(slot_id, false):
 			return null
-		party_spawning_players[player_id] = true
+		party_spawning_players[slot_id] = true
 	top_edge_grass.get_node("CollisionShape2D").set_disabled(true)
 	var new_duck = duck_node.instantiate()
-	if player_id < 0:
+	if slot_id < 0:
 		duck = new_duck
 	else:
-		new_duck.name = "DuckPlayer" + str(player_id + 1)
-		party_ducks[player_id] = new_duck
+		new_duck.name = "DuckSlot" + str(slot_id + 1)
+		party_ducks[slot_id] = new_duck
 	new_duck.input_pickable = false
 	new_duck.velocity = Vector2.ZERO
 	new_duck.speed += duck_speed_round_multiplier * round_current
-	new_duck.next_duck.connect(_on_next_duck.bind(new_duck, player_id))
+	new_duck.next_duck.connect(_on_next_duck.bind(new_duck, slot_id))
 	new_duck.hide()
 	# Increase "randomness feeling" of duck types getting spawned by using a shuffle bag
 	# See https://docs.godotengine.org/en/stable/tutorials/math/random_number_generation.html#better-randomness-using-shuffle-bags
@@ -875,10 +949,15 @@ func _spawn_duck(player_id := -1):
 	)
 	var _min_x = 0 + (_duck_width * 0.5)
 	var _max_x = _viewport_width - (_duck_width * 0.5)
-	if player_id >= 0 and party_player_count > 1:
-		var lane_width = float(_viewport_width) / float(party_player_count)
-		_min_x = max(_min_x, player_id * lane_width + (_duck_width * 0.5))
-		_max_x = min(_max_x, (player_id + 1) * lane_width - (_duck_width * 0.5))
+	# Spread the flock out across the screen. This used to be one lane per PLAYER, which is what
+	# made four players into four separate games: your duck was always in your own strip and
+	# nobody else's crosshair had any reason to be there. Now the band belongs to a SLOT, and its
+	# only job is spacing - two ducks rising from the same spot would make "which one do you go
+	# for" a non-choice. Every player can chase any band.
+	if slot_id >= 0 and PARTY_SHARED_DUCK_COUNT > 1:
+		var band_width = float(_viewport_width) / float(PARTY_SHARED_DUCK_COUNT)
+		_min_x = max(_min_x, slot_id * band_width + (_duck_width * 0.5))
+		_max_x = min(_max_x, (slot_id + 1) * band_width - (_duck_width * 0.5))
 	var _new_x = randi_range(roundi(_min_x), roundi(max(_min_x, _max_x)))
 	var _new_y = _duck_hidden_in_grass_y
 	var _new_position = Vector2(_new_x, _new_y)
@@ -890,14 +969,14 @@ func _spawn_duck(player_id := -1):
 	#print("duck.position new: " + str(_new_position))
 	# Attention: This runs _ready() of Duck scene!
 	get_tree().current_scene.add_child(new_duck)
-	if player_id >= 0:
-		_add_party_player_label(new_duck, player_id)
+	# No number over the duck any more. The number meant "this one is yours", and in a scramble
+	# that label would be a lie about who is allowed to shoot it.
 	new_duck.show()
 	new_duck.velocity = new_duck.random_up_direction() * new_duck.speed
 	new_duck.input_pickable = true
 	top_edge_grass.get_node("CollisionShape2D").set_disabled(false)
-	if player_id >= 0:
-		party_spawning_players.erase(player_id)
+	if slot_id >= 0:
+		party_spawning_players.erase(slot_id)
 	return new_duck
 
 
@@ -907,9 +986,63 @@ func _spawn_party_ducks():
 			old_duck.queue_free()
 	party_ducks.clear()
 	party_spawning_players.clear()
-	for player_id in range(party_player_count):
-		await _spawn_duck(player_id)
+	# PARTY_SHARED_DUCK_COUNT, not party_player_count: the flock is the same size whether one
+	# person is playing or four. That is the whole point - fewer ducks than players is what makes
+	# them contested.
+	for slot_id in range(PARTY_SHARED_DUCK_COUNT):
+		await _spawn_duck(slot_id)
 		await get_tree().create_timer(0.12).timeout
+
+
+# A running per-player scoreboard along the top of the screen.
+#
+# The scramble does not work without it. "First to hit it scores" is only a contest if the players
+# can see who is winning while they play; with nothing but the shared total on screen, four people
+# shooting the same flock have no way to tell whether they are ahead, so there is nothing at stake
+# in any individual duck. The colours match the crosshair numbers.
+func _create_party_score_hud() -> void:
+	party_hud_layer = CanvasLayer.new()
+	party_hud_layer.layer = 1002
+	# Parented to main rather than to get_tree().current_scene: this runs from _ready(), where
+	# current_scene is not reliably set yet, and main IS that scene's root anyway.
+	add_child(party_hud_layer)
+	var viewport_size := get_viewport().get_visible_rect().size
+	var column_width := viewport_size.x / float(maxi(party_player_count, 1))
+	for player_id in range(party_player_count):
+		party_scores[player_id] = 0
+		var label := Label.new()
+		label.name = "PartyScorePlayer" + str(player_id + 1)
+		label.position = Vector2(column_width * float(player_id), 2)
+		label.size = Vector2(column_width, 12)
+		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		label.add_theme_font_size_override("font_size", 7)
+		label.add_theme_color_override("font_color", Color(1.0, 0.75, 0.12))
+		label.add_theme_color_override("font_outline_color", Color.BLACK)
+		label.add_theme_constant_override("outline_size", 4)
+		label.z_index = 1002
+		party_hud_layer.add_child(label)
+		party_score_labels[player_id] = label
+	_refresh_party_scores()
+	# Built in _ready(), which runs before the title card, so it starts hidden and comes up with
+	# info_elements when the round does - a row of zeroes over the title card would be claiming
+	# the game had started.
+	party_hud_layer.visible = not intro_screen.visible
+
+
+func _refresh_party_scores() -> void:
+	for player_id in party_score_labels.keys():
+		var label: Label = party_score_labels[player_id]
+		if not is_instance_valid(label):
+			continue
+		label.text = "P%d  %s" % [player_id + 1, format_score(str(int(party_scores.get(player_id, 0))))]
+		# Greyed out while locked out, so the penalty is legible from the score row as well as
+		# from the crosshair - a player looking at their own number should see why nothing
+		# happened when they flicked.
+		var locked := _party_is_locked(player_id)
+		label.add_theme_color_override(
+			"font_color",
+			Color(0.55, 0.55, 0.58) if locked else Color(1.0, 0.75, 0.12)
+		)
 
 
 func _add_party_player_label(target_duck, player_id: int) -> void:
@@ -928,6 +1061,8 @@ func _add_party_player_label(target_duck, player_id: int) -> void:
 
 
 # Function connected to "next_duck" signal from Duck scene
+# player_id is a SLOT index in Party Mode (see _spawn_duck) and a real player id only on the
+# intro screen, where each player still has their own duck to prove their ball with.
 func _on_next_duck(source_duck = null, player_id := -1):
 	var active_duck = duck if source_duck == null else source_duck
 	if active_duck.has_meta("intro_duck") and not intro_screen.visible:
@@ -949,25 +1084,29 @@ func _on_next_duck(source_duck = null, player_id := -1):
 	var _duck_hit_position = active_duck.duck_hit_position
 	var _duck_type = active_duck.current_duck_type
 	if party_mode and player_id >= 0:
-		if party_ducks.get(player_id) == active_duck:
-			party_ducks.erase(player_id)
-		party_spawning_players.erase(player_id)
+		var slot_id := player_id
+		if party_ducks.get(slot_id) == active_duck:
+			party_ducks.erase(slot_id)
+		party_spawning_players.erase(slot_id)
 		if not intro_screen.visible:
 			if active_duck.duck_hit:
 				# Queue the dog BEFORE the scoreboard await. _increase_ducks_shot() waits 0.5s
 				# (1s on the last duck of a round), and queuing after it put the dog that much
 				# further from the moment of the hit for no reason.
 				#
-				# Deliberately not awaited: in Party Mode every player has their own duck and
-				# their own respawn clock, so waiting out a ~1.7s animation would stall that
-				# player's next duck, and with four players stall it repeatedly.
+				# Deliberately not awaited: the slot's respawn clock runs behind this, so waiting
+				# out a ~1.7s animation would hold the flock a duck short for that whole time -
+				# and with a flock of two, that is half of everything there is to shoot at.
 				if present_hit_duck:
 					_queue_hit_duck_for_dog(_duck_hit_position, _duck_type)
+				# Credit goes to whoever shot it, which the duck itself recorded (see
+				# _award_party_hit). The global total still moves too, because the highscore board
+				# is one number for the whole session.
+				_award_party_hit(active_duck)
 				await _increase_ducks_shot()
-				score_current += points_per_duck
 			await get_tree().create_timer(0.45).timeout
 			if game_over_timer.is_stopped():
-				await _spawn_duck(player_id)
+				await _spawn_duck(slot_id)
 		return
 	if (
 			game_over_timer.is_stopped()
@@ -1245,12 +1384,45 @@ func _get_gripball_player_target(player_id: int):
 		if intro_duck and is_instance_valid(intro_duck) and intro_duck.get("input_pickable"):
 			return intro_duck.global_position
 		return null
-	var target_duck = party_ducks.get(player_id)
-	if not target_duck or not is_instance_valid(target_duck):
+	# The duck NEAREST this player's crosshair, out of the whole flock. Not "their" duck - there
+	# is no such thing now - and deliberately not "the duck nobody else is chasing" either: two
+	# crosshairs converging on the same duck is the race, and steering one of them away would be
+	# the game deciding the contest instead of the players.
+	#
+	# This is also competitive axis 3 (see PARTY_SHARED_DUCK_COUNT): whichever duck you shot last
+	# is where your crosshair now sits, so it decides what you are close enough to contest next.
+	var nearest = null
+	var nearest_distance := INF
+	# Where that player's crosshair is, from last frame - gripball_input writes party_positions
+	# after it calls this. One frame of lag cannot matter: the choice is self-stabilizing, because
+	# moving toward the nearest duck is what keeps it the nearest one.
+	var origin: Vector2 = GripballInput.party_positions.get(
+		player_id, get_viewport().get_visible_rect().size * 0.5
+	)
+	for slot_id in party_ducks.keys():
+		var candidate = party_ducks[slot_id]
+		if not candidate or not is_instance_valid(candidate):
+			continue
+		if not candidate.get("input_pickable"):
+			continue
+		var distance := origin.distance_to(candidate.global_position)
+		if distance < nearest_distance:
+			nearest_distance = distance
+			nearest = candidate
+	if not nearest:
 		return null
-	if not target_duck.get("input_pickable"):
-		return null
-	return target_duck.global_position
+	party_target_keys[player_id] = nearest.get_instance_id()
+	return nearest.global_position
+
+
+# Which duck _get_gripball_player_target() last steered this player at, as an instance id. Read by
+# gripball_input to re-arm the aim trill when the answer changes.
+#
+# It changes often now: the duck you were closing in on gets taken by somebody else, or you take
+# it yourself, and the crosshair swings to another one mid-squeeze. That is the new duck's own
+# approach and it needs its own trill - see _update_party_tracking.
+func _get_gripball_player_target_key(player_id: int) -> int:
+	return int(party_target_keys.get(player_id, 0))
 
 
 func _on_gripball_player_shot(player_id: int, aim_position := Vector2.ZERO) -> void:
@@ -1301,22 +1473,91 @@ func _on_gripball_player_shot(player_id: int, aim_position := Vector2.ZERO) -> v
 		return
 	if not party_mode or ignore_shots:
 		return
-	var target_duck = party_ducks.get(player_id)
-	if not target_duck or not is_instance_valid(target_duck):
+	# Locked out by their own last miss. Nothing to do with any duck - see PARTY_MISS_LOCK_SEC.
+	if _party_is_locked(player_id):
 		shotgun_empty_player.play()
-		await get_tree().create_timer(0.22).timeout
-		if is_instance_valid(shotgun_reload_player):
-			shotgun_reload_player.play()
 		return
+	# Firing is unconditional from here. It used to be gated on party_ducks.get(player_id) - "is
+	# your own duck alive" - and that gate is the bug Pan reported (2026-08-06: 如果2號鴨子被打到
+	# ，1號會暫時無法發射，等新的2號鴨子出現才能再開槍 ... 我覺得這是嚴重的錯誤).
+	#
+	# The mechanism: player 2's duck being shot erased the entry, and party_ducks was keyed BY
+	# PLAYER, so with two grip balls the two players' keys were 0 and 1 - the same numbers the
+	# slots use. A duck dying freed a key that the other player's shot then found empty, and an
+	# empty entry meant a click and nothing else until the respawn ~0.45s later.
+	#
+	# It cannot come back in this shape: a shot is no longer looked up by the shooter at all. It
+	# tests the whole flock, so who else has just hit what is irrelevant to whether you can fire.
 	_play_shot_with_shell()
-	var collision := target_duck.get_node_or_null("CollisionShape2D") as CollisionShape2D
-	if collision and collision.shape and collision.shape.get_rect().has_point(collision.to_local(aim_position)):
-		target_duck.shoot()
+	var target_duck = _party_duck_at(aim_position)
+	if target_duck:
+		# First one to land it takes it, and the loser of that race is treated as having missed.
+		#
+		# The duck_hit test has to come BEFORE the credit is written. shoot() already returns early
+		# on an already-dead duck, so the hit itself cannot double-count - but writing shot_by
+		# unconditionally would let the second player through the door to overwrite the first
+		# player's name on the way out, handing the points to whoever fired last instead of first.
+		if target_duck.duck_hit:
+			_play_web_shot_miss(aim_position, player_id)
+			_party_lock_player(player_id)
+		else:
+			target_duck.set_meta("shot_by", player_id)
+			target_duck.shoot()
 	else:
 		# Miss. Placed at the crosshair rather than at the duck: this is feedback about where
 		# the player's own shot went, so it has to come from where they were pointing - a miss
 		# that sounds from the duck's position would read as a hit that failed to register.
 		_play_web_shot_miss(aim_position, player_id)
+		_party_lock_player(player_id)
+
+
+# The duck under this point, or null. Checks every duck in the flock rather than one player's own,
+# which is the difference between a scramble and four parallel games.
+#
+# Nearest-first, so a shot landing where two ducks overlap goes to the one actually aimed at
+# rather than to whichever slot happens to be enumerated first.
+func _party_duck_at(aim_position: Vector2):
+	var best = null
+	var best_distance := INF
+	for slot_id in party_ducks.keys():
+		var candidate = party_ducks[slot_id]
+		if not candidate or not is_instance_valid(candidate) or not candidate.get("input_pickable"):
+			continue
+		var collision := candidate.get_node_or_null("CollisionShape2D") as CollisionShape2D
+		if not collision or not collision.shape:
+			continue
+		if not collision.shape.get_rect().has_point(collision.to_local(aim_position)):
+			continue
+		var distance := aim_position.distance_to(candidate.global_position)
+		if distance < best_distance:
+			best_distance = distance
+			best = candidate
+	return best
+
+
+# Score the hit to whoever pulled the trigger. The duck carries the shooter because the hit is
+# resolved in _on_gripball_player_shot but paid out in _on_next_duck, ~1.1s later once the duck
+# has finished falling - by which time three other people may have fired.
+func _award_party_hit(hit_duck) -> void:
+	score_current += points_per_duck
+	if not hit_duck or not hit_duck.has_meta("shot_by"):
+		return
+	var shooter := int(hit_duck.get_meta("shot_by"))
+	party_scores[shooter] = int(party_scores.get(shooter, 0)) + points_per_duck
+	_refresh_party_scores()
+
+
+func _party_is_locked(player_id: int) -> bool:
+	var now := Time.get_ticks_msec() / 1000.0
+	return now < float(party_locked_until.get(player_id, 0.0))
+
+
+# Take this player out of the running for PARTY_MISS_LOCK_SEC. Their crosshair dims for the
+# duration, because a lock-out you cannot see is indistinguishable from the game ignoring you.
+func _party_lock_player(player_id: int) -> void:
+	party_locked_until[player_id] = (Time.get_ticks_msec() / 1000.0) + PARTY_MISS_LOCK_SEC
+	GripballInput.set_player_locked(player_id, PARTY_MISS_LOCK_SEC)
+	_refresh_party_scores()
 
 
 # Where the shot was aimed, in viewport coordinates. Gripball shots arrive here as synthetic

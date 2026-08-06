@@ -295,6 +295,183 @@ console.log("\nThe title card's ducks cannot score in the round that follows");
         "the guard must not fire while the card is still showing");
 }
 
+console.log("\nEvery player shoots at the same flock");
+{
+  // Pan, 2026-08-06: 如果2號鴨子被打到，1號會暫時無法發射，等新的2號鴨子出現才能再開槍 /
+  // 我覺得這是嚴重的錯誤 - plus 目前有點太無聊 ... 讓遊戲比較有競爭.
+  //
+  // Both were the same line of code: party_ducks was keyed by PLAYER, so a shot was looked up as
+  // "is your own duck alive". That made the ducks private (four parallel single-player games,
+  // nothing to compete over) AND made one player's kill briefly erase another player's ability to
+  // fire, because with two balls the player keys 0/1 collided with what are now slot keys.
+  const shot = func(main, "_on_gripball_player_shot");
+  check("firing does not depend on any duck existing",
+        !/var target_duck = party_ducks\.get\(player_id\)/.test(shot),
+        "this lookup IS the bug: another player's kill emptied the entry this one read");
+  check("a shot is resolved against the whole flock",
+        /var target_duck = _party_duck_at\(aim_position\)/.test(shot));
+  check("the shot always fires before the flock is consulted",
+        shot.indexOf("_play_shot_with_shell()") < shot.indexOf("_party_duck_at("),
+        "no arrangement of ducks may turn a trigger pull into silence");
+
+  const at = func(main, "_party_duck_at");
+  check("_party_duck_at exists", Boolean(at));
+  check("it iterates every slot rather than indexing by player",
+        /for slot_id in party_ducks\.keys\(\)/.test(at));
+  check("...and takes the nearest of overlapping ducks",
+        /if distance < best_distance:/.test(at),
+        "first-enumerated would hand the hit to whichever slot happened to come first");
+  check("...skipping ducks that are not shootable",
+        /not candidate\.get\("input_pickable"\)/.test(at));
+
+  // The flock is a fixed size. Sizing it by player count is what made the ducks private.
+  const spawnAll = func(main, "_spawn_party_ducks");
+  check("the flock size is independent of how many people are playing",
+        /for slot_id in range\(PARTY_SHARED_DUCK_COUNT\)/.test(spawnAll),
+        "range(party_player_count) is one duck each, which is the design being replaced");
+  check("there are fewer ducks than a full table of players",
+        Number((main.match(/PARTY_SHARED_DUCK_COUNT = (\d+)/) || [])[1]) < 4,
+        "one duck per player, by any other spelling, is not contested");
+  const spawn = func(main, "_spawn_duck");
+  check("the spawn band belongs to a slot, not a player",
+        /if slot_id >= 0 and PARTY_SHARED_DUCK_COUNT > 1:/.test(spawn),
+        "per-player lanes kept each player's duck inside their own strip of screen");
+  check("ducks no longer wear an owner's number",
+        !/_add_party_player_label\(new_duck/.test(spawn),
+        "a number over a contested duck claims an ownership that no longer exists");
+
+  // Tracking has to reach the whole flock too, or the scramble is unaimable.
+  const target = func(main, "_get_gripball_player_target");
+  check("tracking considers every duck in the flock",
+        /for slot_id in party_ducks\.keys\(\)/.test(target));
+  check("...choosing the one nearest that player's own crosshair",
+        /GripballInput\.party_positions\.get\(/.test(target) && /if distance < nearest_distance:/.test(target),
+        "this is the 'which duck do you go for' axis Pan asked about");
+  check("the intro screen still gives each player their own duck",
+        /if intro_screen\.visible:\s*\n\s*var intro_duck = intro_party_ducks\.get\(player_id\)/.test(target),
+        "that is how a ball proves itself; sharing it would break _intro_required_players");
+}
+
+console.log("\nA contested duck can only be scored once");
+{
+  const shot = func(main, "_on_gripball_player_shot");
+  // The race is the mechanic, so losing it has to be indistinguishable from missing.
+  check("the loser of a race is treated as a miss",
+        /if target_duck\.duck_hit:\s*\n(?:\s*#[^\n]*\n)*\s*_play_web_shot_miss\(aim_position, player_id\)\s*\n\s*_party_lock_player\(player_id\)/
+          .test(shot),
+        "a free shot at an already-dead duck is the mash strategy with extra steps");
+  check("credit is only written for a duck that was still alive",
+        shot.indexOf("if target_duck.duck_hit:") < shot.indexOf('set_meta("shot_by", player_id)'),
+        "writing shot_by unconditionally hands the points to whoever fired LAST");
+
+  const award = func(main, "_award_party_hit");
+  check("_award_party_hit exists", Boolean(award));
+  check("it pays the player the duck recorded, not the one respawning the slot",
+        /var shooter := int\(hit_duck\.get_meta\("shot_by"\)\)/.test(award),
+        "the payout happens ~1.1s after the shot, by which time player_id means a slot");
+  check("...and still moves the shared total for the highscore board",
+        /score_current \+= points_per_duck/.test(award));
+  const next = func(main, "_on_next_duck");
+  check("the party branch pays out through it exactly once",
+        /_award_party_hit\(active_duck\)/.test(next) &&
+        (next.match(/score_current \+= points_per_duck/g) || []).length === 1,
+        "leaving the old score_current line beside the call would double every duck");
+}
+
+console.log("\nMissing costs the shooter their next shot");
+{
+  // Bullets are effectively infinite in party mode (max_bullets = party_player_count * 99), so
+  // without a cost the optimal play is to flick as fast as the cooldown allows - which would
+  // collapse the grip-strength, timing and target-choice axes into mashing.
+  const shot = func(main, "_on_gripball_player_shot");
+  check("a locked player's flick does nothing but click",
+        /if _party_is_locked\(player_id\):\s*\n\s*shotgun_empty_player\.play\(\)\s*\n\s*return/.test(shot));
+  check("the lock is checked before the shot is played, not after",
+        shot.indexOf("_party_is_locked(player_id)") < shot.indexOf("_play_shot_with_shell()"),
+        "a lock that still fires the gun is not a lock");
+  check("an ordinary miss arms it",
+        /_play_web_shot_miss\(aim_position, player_id\)\s*\n\s*_party_lock_player\(player_id\)/.test(shot));
+  check("a hit does not", !/target_duck\.shoot\(\)\s*\n\s*_party_lock_player/.test(shot));
+
+  const lock = func(main, "_party_lock_player");
+  check("_party_lock_player exists", Boolean(lock));
+  check("the lock is per player, not global",
+        /party_locked_until\[player_id\] =/.test(lock),
+        "a shared lock would recreate the bug this commit removes, on purpose");
+  check("it is short enough to be a cost rather than a benching",
+        Number((main.match(/PARTY_MISS_LOCK_SEC = ([\d.]+)/) || [])[1]) <= 2.0);
+  check("it is long enough to outlast the shot cooldown it is meant to discourage",
+        Number((main.match(/PARTY_MISS_LOCK_SEC = ([\d.]+)/) || [])[1]) >= 0.5);
+  check("the penalty is shown, not just enforced",
+        /GripballInput\.set_player_locked\(player_id, PARTY_MISS_LOCK_SEC\)/.test(lock),
+        "an invisible lock reads as a broken ball, so players debug instead of adapting");
+
+  const setLocked = func(input, "set_player_locked");
+  check("gripball_input accepts the lock", Boolean(setLocked));
+  const party = func(input, "_update_party_tracking");
+  check("a locked crosshair dims", /sprite\.modulate\.a = 0\.35 if locked else 1\.0/.test(party));
+  check("...and stops tracking, so the penalty is felt as well as seen",
+        /if locked:\s*\n\s*party_positions\[player_id\] = current\s*\n\s*sprite\.position = current\s*\n\s*continue/
+          .test(party));
+  check("locks are dropped when the player count changes",
+        /party_locked_until\.clear\(\)/.test(func(input, "_setup_party_crosshairs")),
+        "player ids are re-indexed on connect, so a stale lock would hit the wrong ball");
+}
+
+console.log("\nThe aim trill re-arms when the crosshair is handed a new duck");
+{
+  // party_tone_spent makes arriving silent, so one hold cannot drone. With a shared flock the
+  // target now changes WITHOUT a release - the player took that duck, or somebody else did - and
+  // the trill would stay silent through the next approach, which is the approach that matters.
+  const party = func(input, "_update_party_tracking");
+  check("a change of target re-arms the tone mid-squeeze",
+        /if target_key != int\(party_target_keys\.get\(player_id, 0\)\):\s*\n\s*party_target_keys\[player_id\] = target_key\s*\n\s*party_tone_spent\[player_id\] = false/
+          .test(party));
+  check("...before the arrival test, so arriving still silences it",
+        party.indexOf("party_tone_spent[player_id] = false") <
+        party.indexOf("if current.distance_to(target) <= TRACK_LOCK_RADIUS:"),
+        "re-arming after would make a locked-on crosshair chirp every frame");
+  check("release still re-arms it too",
+        /if strength <= TRACK_PRESS_FLOOR:[\s\S]{0,400}party_tone_spent\[player_id\] = false/.test(party));
+  check("main.gd reports which duck it steered them at",
+        Boolean(func(main, "_get_gripball_player_target_key")) &&
+        /party_target_keys\[player_id\] = nearest\.get_instance_id\(\)/
+          .test(func(main, "_get_gripball_player_target")),
+        "positions cannot stand in for identity: two ducks can pass through the same point");
+  check("the call is guarded, so a scene without it still tracks",
+        /if scene\.has_method\("_get_gripball_player_target_key"\)/.test(party));
+}
+
+console.log("\nEach player can see whether they are winning");
+{
+  // A scramble is only a contest if the standings are visible while it happens. The shared total
+  // says nothing about who is ahead.
+  const hud = func(main, "_create_party_score_hud");
+  check("_create_party_score_hud exists", Boolean(hud));
+  check("there is one label per player", /for player_id in range\(party_player_count\)/.test(hud));
+  check("it is built in party mode only",
+        /if party_mode:[\s\S]{0,1200}_create_party_score_hud\(\)/.test(func(main, "_ready")));
+  check("it does not sit over the title card",
+        /party_hud_layer\.visible = not intro_screen\.visible/.test(hud),
+        "a row of zeroes before the round starts claims the game is already running");
+  check("...and comes up with the rest of the HUD",
+        /party_hud_layer\.show\(\)/.test(func(main, "_exit_intro_screen")));
+  check("...and goes away with it",
+        /party_hud_layer\.hide\(\)/.test(func(main, "_show_highscore_screen")),
+        "the highscore screen shows a different number entirely");
+  check("it is parented to main, not to current_scene",
+        /\n\tadd_child\(party_hud_layer\)/.test(hud),
+        "_ready() runs before current_scene is reliably set");
+
+  const refresh = func(main, "_refresh_party_scores");
+  check("a locked player is greyed out in the standings too", /if locked else Color\(1\.0, 0\.75, 0\.12\)/.test(refresh));
+  check("an expired lock is un-greyed by _process, since nothing emits that",
+        /if any_locked != party_scores_showing_lock:/.test(func(main, "_process")));
+  check("...and only when it has actually changed",
+        /party_scores_showing_lock = any_locked\s*\n\s*_refresh_party_scores\(\)/.test(func(main, "_process")),
+        "re-applying theme overrides every frame for nothing");
+}
+
 console.log("\nmain.gd and gripball_input.gd actually ship");
 {
   const patch = fs.readFileSync(path.join(ROOT, "tools", "patch_pck.py"), "utf8");

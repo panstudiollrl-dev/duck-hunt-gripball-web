@@ -95,6 +95,10 @@
   // If no readings arrive at all we cannot invent a zero. The ball sleeps until squeezed, so
   // this waits for the stream rather than failing outright.
   const QUICK_WAKE_MS = 12000;
+  // A silent ball is nudged every 1.5s, then released and reopened once after this long.
+  const RECONNECT_AFTER_MS = 4500;
+  // How long the background check after enrolment keeps trying before it just reports.
+  const WATCH_MS = 10000;
   // Per-ball adaptation of the bar above. A ball is only asked for this fraction of the
   // largest press it has actually been seen to produce, capped at the configured bar - so a
   // ball with a small range gets a small bar and one with a big range gets the full one, and
@@ -281,19 +285,21 @@
   }
 
   async function command(device, commandId, bytes) {
-    if (!device || !device.opened) return;
+    if (!device || !device.opened) return false;
     const payload = new Uint8Array(26);
     payload[0] = commandId;
     if (bytes) payload.set(bytes.slice(0, 25), 1);
     try {
       await device.sendReport(1, payload);
+      return true;
     } catch (error) {
       console.warn("Gripball command failed", error);
+      return false;
     }
   }
 
   async function stream(player) {
-    await command(player.device, 1, new Uint8Array([3]));
+    return command(player.device, 1, new Uint8Array([3]));
   }
 
   async function haptic(player, intensity, duration) {
@@ -379,13 +385,97 @@
     if (vibrate) await haptic(player, 55, 45);
     updatePlayerNumbers();
     emit({type: "player_count", count: state.players.length});
+    // "Enrolled" only means the port opened. Whether the ball is actually talking is a separate
+    // fact, so find out now and repair it in the background instead of discovering a silent
+    // ball 12 seconds into the start.
+    watchEnrolled(player);
     return true;
+  }
+
+  /**
+   * Has this ball sent grip data recently? Used both to judge a ball alive and to take a
+   * baseline. 1.5s rather than GRIP_STALE_MS because an idle ball reports slowly.
+   */
+  function heardRecently(player) {
+    return player.grip != null && performance.now() - player.lastGripAt < 1500;
+  }
+
+  /**
+   * Release the device and open it again, then re-arm streaming. This is the "unplug and
+   * replug" a person would do: a ball that was asleep when it was enrolled can have lost the
+   * stream command, and re-sending it alone does not always wake it. Only one reconnect runs
+   * per ball at a time, so the background watcher and a start in progress cannot collide.
+   */
+  function reconnectDevice(player) {
+    if (player.reconnecting) return player.reconnecting;
+    const device = player.device;
+    if (!device) return Promise.resolve(false);
+    player.reconnecting = (async () => {
+      try {
+        if (player.onInput) device.removeEventListener("inputreport", player.onInput);
+        if (device.opened) await device.close();
+        await device.open();
+        player.grip = null;
+        player.lastGripAt = 0;
+        if (player.onInput) device.addEventListener("inputreport", player.onInput);
+        return await stream(player);
+      } catch (error) {
+        console.warn("Gripball reconnect failed", error);
+        try {
+          if (player.onInput) device.addEventListener("inputreport", player.onInput);
+        } catch (ignored) { /* the device is gone; the disconnect handler cleans up */ }
+        return false;
+      } finally {
+        player.reconnecting = null;
+      }
+    })();
+    return player.reconnecting;
+  }
+
+  /**
+   * Wait for a ball to talk, escalating instead of just waiting: re-send the stream command
+   * every 1.5s, and if that is not enough, release and reopen the device once. Returns whether
+   * data arrived within totalMs. This is what the old fixed wait lacked - it sent the command
+   * once at enrolment and then hoped.
+   */
+  async function bringAlive(player, totalMs, options = {}) {
+    const start = performance.now();
+    let lastNudge = start;
+    let reconnected = false;
+    let lastUi = 0;
+    while (!heardRecently(player)) {
+      const now = performance.now();
+      if (now - start > totalMs) return false;
+      if (options.abort && options.abort()) return false;
+      if (!reconnected && now - start > RECONNECT_AFTER_MS) {
+        reconnected = true;
+        await reconnectDevice(player);
+        lastNudge = performance.now();
+      } else if (now - lastNudge > 1500) {
+        lastNudge = now;
+        await stream(player);
+      }
+      if (options.ui && now - lastUi > 90) {
+        emitCalibration(player, "PRESS BALL ONCE TO WAKE", 0);
+        lastUi = now;
+      }
+      await sleep(25);
+    }
+    return true;
+  }
+
+  async function watchEnrolled(player) {
+    const stillWaiting = () => state.phase !== "connect" || !state.players.includes(player);
+    const alive = await bringAlive(player, WATCH_MS, {abort: stillWaiting});
+    if (stillWaiting()) return;
+    if (!alive) console.warn("Gripball enrolled but silent", player.playerId);
+    setConnectedStatus("已連接");
   }
 
   function setConnectedStatus(prefix = "已連接") {
     if (state.players.length > 0) {
       setStatus(
-        `${prefix} ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}`).join(" / ")}。` +
+        `${prefix} ${state.players.length} 顆：${state.players.map((p) => `P${p.playerId + 1}${heardRecently(p) ? "" : "（尚無資料，請按一下球）"}`).join(" / ")}。` +
         (state.phase === "connect" && !state.keyboardMode
           ? `拿好球，馬上開始…（要多加一顆就現在按「連接/新增握力球」）`
           : `可繼續新增或開始。`),
@@ -576,6 +666,8 @@
     if (startButton) startButton.style.display = state.phase === "connect" ? "" : "none";
     if (calibrateButton) calibrateButton.style.display = state.phase === "connect" ? "" : "none";
     if (keyboardButton) keyboardButton.style.display = state.phase === "connect" ? "" : "none";
+    const resetButton = document.getElementById("gripball-reset");
+    if (resetButton) resetButton.style.display = state.phase === "connect" ? "" : "none";
     // The row shows itself whenever it holds the only way forward, whatever the saved
     // preference says. The preference is remembered, not lost: applyHudVisibility() honours it
     // again as soon as the buttons are no longer needed.
@@ -718,6 +810,41 @@
       if (error.name !== "NotFoundError") console.error(error);
       setStatus("尚未新增握力球，請再試一次。", "error");
     }
+  }
+
+  /**
+   * Let go of every ball and the browser's memory of them. getDevices() hands back every ball
+   * ever authorized, including ones that are asleep, off or out of range, and the page used to
+   * enrol them all - so a stale entry looked "connected" and then never spoke. This clears
+   * that slate; the balls are then chosen again with 連接/新增握力球 (the chooser needs a
+   * fresh click, so it is not opened from here).
+   */
+  async function resetAllDevices() {
+    if (starting || state.phase === "play" || !navigator.hid) return;
+    cancelAutoStart();
+    setStatus("正在釋放所有握力球…", "waiting");
+    for (const player of state.players) {
+      try {
+        if (player.onInput) player.device.removeEventListener("inputreport", player.onInput);
+      } catch (error) { console.warn("Could not detach Gripball listener", error); }
+      player.onInput = null;
+    }
+    state.players = [];
+    state.startFailed = false;
+    try {
+      for (const device of await navigator.hid.getDevices()) {
+        if (!isGripball(device)) continue;
+        try { if (device.opened) await device.close(); } catch (error) { console.warn(error); }
+        if (typeof device.forget === "function") {
+          try { await device.forget(); } catch (error) { console.warn(error); }
+        }
+      }
+    } catch (error) {
+      console.warn("Could not release authorized Gripballs", error);
+    }
+    emit({type: "player_count", count: 0});
+    refreshUi();
+    setStatus("已釋放全部握力球。請按一下每顆球喚醒它，再按「連接/新增握力球」重新選取。", "waiting");
   }
 
   async function restoreAuthorizedDevices() {
@@ -1239,16 +1366,10 @@
   async function quickStartPlayer(player) {
     const start = performance.now();
     let lastUi = 0;
-    // The ball sleeps until it is touched, so wait for the stream rather than failing.
-    while (!gripIsLive(player)) {
-      if (performance.now() - start > QUICK_WAKE_MS) {
-        throw new Error(`P${player.playerId + 1} 收不到壓力資料，請按一下球喚醒它`);
-      }
-      if (performance.now() - lastUi > 90) {
-        emitCalibration(player, "PRESS BALL ONCE TO WAKE", 0);
-        lastUi = performance.now();
-      }
-      await sleep(25);
+    // The ball sleeps until it is touched, so wait for the stream rather than failing - and
+    // while waiting, keep re-arming it, reopening the device if that is not enough.
+    if (!(await bringAlive(player, QUICK_WAKE_MS, {ui: true}))) {
+      throw new Error(`P${player.playerId + 1} 收不到壓力資料，請按一下球喚醒它`);
     }
 
     // Take the quiet sample. The median is deliberate: a mean would be dragged by a stray
@@ -1256,7 +1377,7 @@
     const samples = [];
     const sampleStart = performance.now();
     while (performance.now() - sampleStart < QUICK_BASELINE_MS) {
-      if (gripIsLive(player)) samples.push(player.grip);
+      if (heardRecently(player)) samples.push(player.grip);
       if (performance.now() - lastUi > 90) {
         emitCalibration(player, "HOLD BALL - DO NOT PRESS", 50);
         lastUi = performance.now();
@@ -1277,12 +1398,57 @@
     emitCalibration(player, "READY", 100, player.baseline);
   }
 
-  async function quickStartAllPlayers() {
+  /**
+   * Take a baseline from every ball. A ball that will not talk is not abandoned and not
+   * silently skipped: first every ball is released and reopened (the unplug-and-replug a
+   * person would do) and the start is retried once. Only if a ball is STILL silent does the
+   * start stop and say which one - and only an explicit second press of 開始遊戲
+   * (allowSkip) goes ahead without it.
+   */
+  async function quickStartAllPlayers(allowSkip) {
     state.phase = "calibrating";
     refreshUi();
     state.calibrationStarted = performance.now();
+    const attempt = async () => {
+      const results = await Promise.allSettled(state.players.map((player) => quickStartPlayer(player)));
+      return state.players.filter((player, index) => results[index].status === "rejected");
+    };
     // All at once: nobody has to take turns when there is nothing to perform.
-    await Promise.all(state.players.map((player) => quickStartPlayer(player)));
+    let silent = await attempt();
+    if (silent.length) {
+      setStatus(
+        `${silent.map((p) => `P${p.playerId + 1}`).join("、")} 沒有資料，正在重新連線所有握力球…`,
+        "waiting"
+      );
+      await Promise.all(state.players.map((player) => reconnectDevice(player)));
+      silent = await attempt();
+    }
+    if (silent.length) {
+      const names = silent.map((p) => `P${p.playerId + 1}`).join("、");
+      // Make the silent ball identifiable: which physical ball is P2 is not obvious.
+      for (const player of silent) {
+        for (let i = 0; i < 3; i += 1) {
+          await haptic(player, 72, 55);
+          await sleep(160);
+        }
+      }
+      const healthy = state.players.filter((p) => !silent.includes(p));
+      if (!allowSkip || !healthy.length) {
+        throw new Error(
+          `${names} 重新連線後仍收不到資料。` +
+          `按一下那顆球後再按「開始遊戲」會略過它直接玩，或按「重設握力球」重新選取`
+        );
+      }
+      for (const player of silent) {
+        if (player.device && player.onInput) {
+          player.device.removeEventListener("inputreport", player.onInput);
+        }
+      }
+      state.players = healthy;
+      updatePlayerNumbers();
+      state.skippedNote = `（${names} 沒有資料，已略過）`;
+      console.warn("Gripballs skipped by request, no grip data:", names);
+    }
     refreshTuningUi();
   }
 
@@ -1335,7 +1501,7 @@
    * @param {boolean} withCalibration Run the old three-round sequence. Default is not to:
    *   a fixed threshold needs only a zero, so the normal path just takes one and starts.
    */
-  async function startGame(withCalibration) {
+  async function startGame(withCalibration, allowSkip = false) {
     if (state.players.length < 1 || state.phase !== "connect") return;
     // The phase check above is not enough on its own: phase only changes after the first
     // await, so an auto-start and an impatient click on 開始遊戲 could both get past it and
@@ -1344,6 +1510,7 @@
     if (starting) return;
     starting = true;
     state.startFailed = false;
+    state.skippedNote = "";
     // Whoever gets here first wins; a pending timer must not fire a second start on top.
     cancelAutoStart();
     try {
@@ -1353,7 +1520,7 @@
         await calibrateAllPlayers();
       } else {
         setStatus(`拿好 ${state.players.length} 顆握力球，先不要按…`, "waiting");
-        await quickStartAllPlayers();
+        await quickStartAllPlayers(allowSkip);
       }
       state.phase = "starting";
       setStatus(`正在標記 ${state.players.length} 顆握力球編號…`, "waiting");
@@ -1369,9 +1536,9 @@
       // audio suspended and nothing will be audible until the player touches the page. Say so,
       // rather than leaving a silent game looking broken.
       setStatus(
-        audioIsBlocked()
+        (audioIsBlocked()
           ? `開始！握住追蹤鴨子，甩動才發射。（點一下畫面開聲音）`
-          : `開始！握住追蹤鴨子，甩動才發射。`,
+          : `開始！握住追蹤鴨子，甩動才發射。`) + (state.skippedNote || ""),
         "ready"
       );
     } catch (error) {
@@ -1383,7 +1550,7 @@
       setStatus(
         withCalibration
           ? `校正失敗：${error.message || error}。請放開握力球後再開始。`
-          : `無法自動開始：${error.message || error}。請按「開始遊戲」重試。`,
+          : `無法自動開始（請按「開始遊戲」重試）：${error.message || error}`,
         "error"
       );
       // Reveals the row via needsButtons() without overwriting the saved preference, so hiding
@@ -1542,7 +1709,7 @@
     document.head.appendChild(style);
     const panel = document.createElement("div");
     panel.id = "gripball-webhid";
-    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><button id="gripball-calibrate" disabled title="舊的三輪校正流程。固定門檻對這顆球不合用時才需要">重新校正</button><button id="gripball-keyboard">鍵盤測試</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
+    panel.innerHTML = '<button id="gripball-connect">連接/新增握力球</button><button id="gripball-start" disabled>開始遊戲</button><button id="gripball-calibrate" disabled title="舊的三輪校正流程。固定門檻對這顆球不合用時才需要">重新校正</button><button id="gripball-keyboard">鍵盤測試</button><button id="gripball-reset" title="釋放所有握力球並清除瀏覽器記住的授權，之後重新按「連接/新增握力球」選取">重設握力球</button><span id="gripball-status">先連接所有要玩的握力球，再按開始。</span><button id="gripball-hide" title="隱藏這一列">×</button>';
     document.body.appendChild(panel);
     const dot = document.createElement("button");
     dot.id = "gripball-show";
@@ -1568,8 +1735,10 @@
     document.getElementById("gripball-connect").addEventListener("click", addDevices);
     // Wrapped, not passed directly: a click handler receives the event, which is truthy, so
     // handing startGame straight to addEventListener would run the old calibration every time.
+    // A second press after a failed start is the player saying "go without the silent ball".
     document.getElementById("gripball-start")
-      .addEventListener("click", () => startGame(false));
+      .addEventListener("click", () => startGame(false, state.startFailed));
+    document.getElementById("gripball-reset").addEventListener("click", resetAllDevices);
     document.getElementById("gripball-calibrate")
       .addEventListener("click", () => startGame(true));
     document.getElementById("gripball-keyboard").addEventListener("click", startKeyboardTest);

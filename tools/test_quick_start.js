@@ -50,12 +50,15 @@ function tuningDefault(name) {
 const CONSTANTS = [
   "GRIP_STALE_MS", "AUTOZERO_WINDOW_MS",
   "QUICK_ENGAGE_FORCE", "QUICK_RELEASE_RATIO", "QUICK_BASELINE_MS", "QUICK_WAKE_MS",
+  "RECONNECT_AFTER_MS",
   "ADAPTIVE_ENGAGE_RATIO", "ADAPTIVE_ENGAGE_FLOOR",
 ];
 
 const pieces = [
   grab(/function median\(values\) \{[\s\S]*?\n  \}/, "median"),
   grab(/function gripIsLive\(player\) \{[\s\S]*?\n  \}/, "gripIsLive"),
+  grab(/function heardRecently\(player\) \{[\s\S]*?\n  \}/, "heardRecently"),
+  grab(/async function bringAlive\(player, totalMs, options = \{\}\) \{[\s\S]*?\n  \}/, "bringAlive"),
   grab(/function engageForceFor\(player\) \{[\s\S]*?\n  \}/, "engageForceFor"),
   grab(/function estimateGrip\(player, grip\) \{[\s\S]*?\n  \}/, "estimateGrip"),
   grab(/async function quickStartPlayer\(player\) \{[\s\S]*?\n  \}/, "quickStartPlayer"),
@@ -77,6 +80,10 @@ const harness = `
   const emitted = [];
   const performance = {now: () => clock};
   const console = {warn() {}};
+  let streamCalls = 0;
+  let reconnectCalls = 0;
+  function stream() { streamCalls += 1; return Promise.resolve(true); }
+  function reconnectDevice() { reconnectCalls += 1; return Promise.resolve(true); }
   const tuning = {engageForce: ${ENGAGE}, releaseForce: ${RELEASE}, fullForce: ${FULL}};
   const state = {phase: "play", players: []};
   function sleep(ms) {
@@ -91,12 +98,13 @@ const harness = `
   ${pieces.join("\n")}
   return {
     quickStartPlayer, estimateGrip, engageForceFor, tuning, state,
+    calls: () => ({stream: streamCalls, reconnect: reconnectCalls}),
     setTrace(fn) { trace = fn; },
     now: () => clock,
     advance(ms) { clock += ms; },
     emitted: () => emitted.slice(),
     setPhase(p) { state.phase = p; },
-    reset() { clock = 0; trace = null; emitted.length = 0; state.phase = "play"; },
+    reset() { clock = 0; trace = null; emitted.length = 0; state.phase = "play"; streamCalls = 0; reconnectCalls = 0; },
   };
 `;
 const mod = new Function(harness)();
@@ -211,6 +219,12 @@ async function main() {
           String(deadThrew && deadThrew.message));
     check("...and says to press the ball to wake it",
           deadThrew && /喚醒/.test(deadThrew.message), deadThrew && deadThrew.message);
+    // The point of the rewrite: a silent ball is actively repaired, not just waited on.
+    const calls = mod.calls();
+    check("a silent ball gets its stream command re-sent while waiting", calls.stream >= 3,
+          JSON.stringify(calls));
+    check("...and is released and reopened exactly once", calls.reconnect === 1,
+          JSON.stringify(calls));
     check("it gives up waiting rather than hanging forever",
           mod.now() >= constant("QUICK_WAKE_MS") && mod.now() < constant("QUICK_WAKE_MS") * 1.5,
           mod.now() + "ms");
@@ -445,9 +459,9 @@ async function main() {
   console.log("\nThe old calibration is still reachable as a fallback");
   {
     check("startGame takes a flag rather than the sequence being deleted",
-          /async function startGame\(withCalibration\)/.test(src));
+          /async function startGame\(withCalibration/.test(src));
     check("the default path is the quick one",
-          /startGame\(false\)/.test(src) && /quickStartAllPlayers\(\)/.test(src));
+          /startGame\(false\)/.test(src) && /quickStartAllPlayers\(/.test(src));
     check("a button still runs the full calibration",
           /startGame\(true\)/.test(src) && /gripball-calibrate/.test(src));
     // Passing startGame straight to addEventListener would hand it an Event - truthy - and

@@ -87,6 +87,7 @@ const harness = `
     node.textContent = text;
     node.dataset.kind = kind || "";
   }
+  function heardRecently() { return true; }
   // Stubbed: records the call instead of running the real start.
   function startGame(withCalibration) {
     starts.push({withCalibration, at: clock, players: state.players.length});
@@ -260,7 +261,7 @@ console.log("\nA failed auto-start does not loop, and leaves the retry visible")
 {
   check("failure does not re-arm the countdown",
         !/catch \(error\) \{[\s\S]*?scheduleAutoStart\(\)[\s\S]*?\n    \}/.test(
-          grab(/async function startGame\(withCalibration\)[\s\S]*?\n  \}/, "startGame")),
+          grab(/async function startGame\(withCalibration[\s\S]*?\n  \}/, "startGame")),
         "scheduleAutoStart must not be called from the catch branch");
   check("failure is recorded so the row stays visible", /state\.startFailed = true;/.test(src));
   check("...and cleared on the next attempt", /state\.startFailed = false;/.test(src));
@@ -418,7 +419,7 @@ console.log("\nRemoving the click did not take audio unlocking with it");
   // And the player is told, rather than being left with a silent game that looks broken. This
   // is the one case that genuinely cannot be fixed in code: a returning player whose balls are
   // already authorized can reach play with zero clicks, and no API can unlock audio then.
-  const startSrc = grab(/async function startGame\(withCalibration\)[\s\S]*?\n  \}/, "startGame");
+  const startSrc = grab(/async function startGame\(withCalibration[\s\S]*?\n  \}/, "startGame");
   check("the ready message warns when audio is still blocked",
         /audioIsBlocked\(\)/.test(startSrc), "no audio check in startGame");
   check("...and says what to do about it", /點一下畫面開聲音/.test(startSrc));
